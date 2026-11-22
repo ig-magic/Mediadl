@@ -282,18 +282,31 @@ async def proxy_media(
         referer = "https://clipssaver.com/"
 
     def _fetch_stream(target_u: str, ref: str):
-        return requests.get(
-            target_u,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-                ),
-                "Referer": ref,
-            },
-            stream=True,
-            timeout=28,
-        )
+        for _ in range(6):
+            target = urllib.parse.urlparse(target_u)
+            target_host = (target.hostname or "").lower()
+            if target.scheme not in ("http", "https") or not any(
+                target_host == h or target_host.endswith("." + h) for h in ALLOWED_PROXY_HOSTS
+            ):
+                raise HTTPException(status_code=400, detail="Unsupported media redirect host.")
+            response = requests.get(
+                target_u,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": ref,
+                },
+                stream=True,
+                timeout=28,
+                allow_redirects=False,
+            )
+            if response.status_code not in (301, 302, 303, 307, 308) or not response.headers.get("Location"):
+                return response
+            target_u = urllib.parse.urljoin(target_u, response.headers["Location"])
+            response.close()
+        raise HTTPException(status_code=502, detail="Too many media redirects.")
 
     upstream = await asyncio.to_thread(_fetch_stream, url, referer)
     # Fallback: if socialhubapi wrapper fails/expires, unwrap `?src=<base64>` directly to Instagram scontent CDN!
@@ -304,7 +317,12 @@ async def proxy_media(
             if src_b64:
                 src_b64 += "=" * (-len(src_b64) % 4)
                 unwrapped = base64.urlsafe_b64decode(src_b64).decode("utf-8")
-                if "cdninstagram.com" in unwrapped or "fbcdn.net" in unwrapped:
+                unwrapped_url = urllib.parse.urlparse(unwrapped)
+                unwrapped_host = (unwrapped_url.hostname or "").lower()
+                if unwrapped_url.scheme == "https" and any(
+                    unwrapped_host == h or unwrapped_host.endswith("." + h)
+                    for h in ("cdninstagram.com", "fbcdn.net")
+                ):
                     upstream = await asyncio.to_thread(_fetch_stream, unwrapped, "https://www.instagram.com/")
         except Exception:
             pass
