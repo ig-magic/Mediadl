@@ -792,20 +792,32 @@ async def api_tg_profile(
 async def api_tg_channel_posts(
     request: Request,
     channel: str = Query(..., description="Public Telegram channel username"),
-    limit: int = Query(8, ge=1, le=20),
+    limit: int = Query(10, ge=1, le=20),
+    before: Optional[int] = Query(None, ge=1),
 ) -> Dict[str, Any]:
     _, ch, _ = classify_telegram_input(channel)
-    posts = await asyncio.to_thread(tg_service.get_recent_channel_posts, ch, limit)
+    # Direct internal callers do not pass FastAPI-injected query defaults.
+    before = before if isinstance(before, int) else None
+    page = await asyncio.to_thread(tg_service.get_channel_posts_page, ch, limit, before)
+    posts = page["posts"]
     _log_req(request, "tg", "Channel Posts List", f"@{ch}", f"✅ {len(posts)} posts")
     return {
         "ok": True,
         "platform": "telegram",
         "channel": ch,
         "count": len(posts),
+        "has_more": page["has_more"],
+        "next_before": page["next_before"],
         "posts": [
             {
                 "post_id": p["post_id"],
                 "icon": p["icon"],
+                "type": p["type"],
+                "text": p["text"],
+                "views": p["views"],
+                "date": p["date"],
+                "preview_url": _proxy_url(p["preview_url"], f"tg_{ch}_{p['post_id']}_preview") if p["preview_url"] else "",
+                "preview_is_video": p["preview_is_video"],
                 "snippet": p["snippet"],
                 "url": f"https://t.me/{ch}/{p['post_id']}",
             }
@@ -821,7 +833,11 @@ async def api_tg_post(
 ) -> Dict[str, Any]:
     kind, ch, pid = classify_telegram_input(url)
     if kind != "tg_post":
-        return await api_tg_channel_posts(request, channel=ch, limit=8)
+        raw_before = request.query_params.get("before", "")
+        if raw_before and (not raw_before.isdigit() or int(raw_before) < 1):
+            raise HTTPException(status_code=422, detail="before must be a positive post ID")
+        before = int(raw_before) if raw_before else None
+        return await api_tg_channel_posts(request, channel=ch, limit=10, before=before)
     post = await asyncio.to_thread(tg_service.download_channel_post, ch, pid)
     items = [_serialize_media_item(m, f"tg_{ch}_{pid}", i) for i, m in enumerate(post.items, 1)]
     _log_req(request, "tg", "Channel Post Media", f"{ch}/{pid}", f"✅ {len(items)} item(s)")
