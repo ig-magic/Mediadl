@@ -1,0 +1,19 @@
+# Optional Vercel Environment Variables (Set in Vercel Project Settings -> Environment Variables)
+
+# Admin Panel Password / Key (defaults to 7707839393 if not set)
+ADMIN_KEY=djsj
+
+# Comma-separated permanent API keys for Website/(key)/.../(query)
+# Default built-in keys: demo, free, socialgrab, and ADMIN_KEY
+API_KEYS=demo,free,socialgrab
+
+# Optional: Forward every Website & API user search live to your Telegram Admin chat!
+TELEGRAM_BOT_TOKEN=
+ADMIN_IDS=283892292
+
+# Optional: Instagram sessionid cookie (Public & Private HD DPs work without this!)
+IG_SESSIONID=
+
+# Optional: Telegram MTProto credentials (from https://my.telegram.org) for TG Stories
+TG_API_ID=
+TG_API_HASH=
