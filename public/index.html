@@ -627,6 +627,8 @@
     @media(max-width:760px){.utility-bar{padding:0 18px}.utility-bar span:last-child,.portal-label,.sidebar-note,.side-footer,.sidebar-label,.heading-tag {display:none}.site-header{height:76px;padding:0 18px}.brand-logo{width:45px;height:45px}.brand-title{font-size:19px}.header-button{padding:9px}.page-shell{display:block}.sidebar{padding:9px 14px;display:flex;flex-direction:row;gap:5px;overflow-x:auto;border-right:0;border-bottom:1px solid #dce7f3}.side-home{width:auto;white-space:nowrap;padding:9px}.nav-tabs{flex-direction:row;flex-wrap:nowrap}.nav-tab{width:auto;white-space:nowrap;padding:9px}.nav-tab span,.side-home span{font-size:16px}.container{padding:20px 16px 28px}.crumb-bar{margin-bottom:20px}.page-heading{margin-bottom:18px}.portal-hero{min-height:250px}.portal-hero-content{padding:28px 24px;width:75%}.hero-art{width:35%;opacity:.55}.hero-art svg{width:135px}.hero-art>span{display:none}.hero-kicker{font-size:8px}.section-intro{margin-top:26px}.page-footer{flex-direction:column}.search-wrap{min-width:0;flex-basis:100%}.search-row>.btn-primary{width:100%}}
     @media(max-width:430px){.utility-bar span:last-child{display:none}.picker-grid{grid-template-columns:1fr 1fr}.picker-item{padding:13px;min-height:160px}.portal-hero-content{width:100%}.hero-art{opacity:.16;width:55%}.portal-hero h2{font-size:32px}.status-badges{margin-top:3px}.hero-card{padding:18px}}
 
+
+    .local-history:not(:empty) {background:#fff;border:1px solid #dce7f3;border-radius:10px;padding:20px;margin:0 0 20px}.history-head {display:flex;justify-content:space-between;align-items:center;gap:12px}.history-head h3 {font-size:16px;color:#193b62;margin:4px 0}.history-head p {font-size:11px;color:#75889d}.history-list {display:flex;gap:8px;overflow-x:auto;margin-top:14px;padding-bottom:4px}.history-item {min-width:155px;max-width:210px;background:#f5f9fe;border:1px solid #dce7f3;border-radius:7px;padding:11px;text-align:left;cursor:pointer;color:#214a77}.history-item span,.history-item small {display:block;font-size:10px;color:#6f89a5}.history-item strong {display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;margin:5px 0}.tg-list-head {display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.tg-list-head h2 {margin-top:7px;font-size:20px}.tg-list-head p {font-size:12px;color:#75889d;margin-top:5px}.tg-page-label {font-size:10px;letter-spacing:.12em;color:#6f89a5;white-space:nowrap}.tg-post-list {display:grid;gap:12px;margin-top:20px}.tg-post-card {border:1px solid #dce7f3;border-radius:9px;background:#fbfdff;padding:17px}.tg-post-top {display:flex;justify-content:space-between;gap:8px;align-items:center;color:#234d78}.tg-post-top small {color:#8193a6}.tg-post-text {white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65;font-size:13px;margin:12px 0;color:#405b76}.tg-post-preview {display:block;max-width:100%;width:auto;max-height:380px;object-fit:contain;background:#eff5fb;border-radius:7px;margin:0 0 14px}.tg-post-actions {display:flex;flex-wrap:wrap;gap:7px}.tg-pagination {display:flex;justify-content:center;align-items:center;gap:15px;margin-top:20px;font-size:12px;color:#647e99}.tg-pagination .btn-primary {padding:9px 16px}.tg-post-card .btn-ghost {padding:7px 10px}
   </style>
 </head>
 <body data-theme="ig">
@@ -707,8 +709,10 @@
         <div class="quick-chips" id="quickChips"></div>
       </section>
 
+      <!-- Saved only in this browser; no HTML or credentials are stored. -->
+      <section id="localHistory" class="local-history" aria-label="Local search history"></section>
       <!-- Dynamic Result Area -->
-      <section id="resultArea"></section>
+      <section id="resultArea" aria-live="polite"></section>
     </main>
 
     <!-- DEVELOPER API DOCS SECTION -->
@@ -918,15 +922,77 @@
       return Number(n).toLocaleString();
     }
 
+    const LOCAL_HISTORY_KEY = 'socialgrab_local_searches_v1';
+    let activeRequest = null;
+    let replayResult = null;
+    let tgPages = [];
+    let tgPageIndex = 0;
+
+    function readLocalHistory() {
+      try { const data = JSON.parse(localStorage.getItem(LOCAL_HISTORY_KEY) || '[]'); return Array.isArray(data) ? data : []; }
+      catch (_) { return []; }
+    }
+    function saveLocalResult(path, data) {
+      // Save only GET search responses; never credentials, login, admin or setup data.
+      if (!/^\/api\/v1\/(instagram|snapchat|telegram)\/(profile|stories|highlights|highlight-items|post|reel|reels|posts|spotlight|snapcode|channel-posts)(?:\?|$)/.test(path)) return;
+      if (!data || data.ok === false) return;
+      const query = document.getElementById('queryInput').value.trim();
+      if (!query || query.length > 1000) return;
+      const entry = { path, data, query, tab: state.tab, action: state.action, at: Date.now() };
+      try {
+        const old = readLocalHistory().filter(x => x && x.path !== path);
+        const list = [entry, ...old].slice(0, 20);
+        while (list.length && JSON.stringify(list).length > 800000) list.pop();
+        localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(list));
+        renderLocalHistory();
+      } catch (_) { /* storage can be blocked or full */ }
+    }
+    function renderLocalHistory() {
+      const el = document.getElementById('localHistory');
+      const entries = readLocalHistory();
+      if (!entries.length) { el.innerHTML = ''; return; }
+      el.innerHTML = `<div class="history-head"><div><span class="eyebrow">SAVED ON THIS DEVICE</span><h3>Recent searches</h3><p>Saved in this browser. Media links may expire.</p></div><button class="btn-ghost" onclick="clearLocalHistory()">Clear history</button></div><div class="history-list">${entries.slice(0,8).map((x,i) => `<button class="history-item" onclick="restoreLocalHistory(${i})"><span>${esc(String(x.tab || '').toUpperCase())} · ${esc(x.action || '')}</span><strong>${esc(x.query || '')}</strong><small>View saved result →</small></button>`).join('')}</div>`;
+    }
+    function clearLocalHistory() {
+      try { localStorage.removeItem(LOCAL_HISTORY_KEY); } catch (_) {}
+      renderLocalHistory();
+    }
+    function restoreLocalHistory(index) {
+      const entry = readLocalHistory()[index];
+      if (!entry || !PLATFORM_CONFIG[entry.tab]) return;
+      cancelActiveRequest(false);
+      pushHistorySnapshot();
+      state.tab = entry.tab; state.action = entry.action;
+      renderChrome(false);
+      document.getElementById('queryInput').value = entry.query;
+      if (entry.path.startsWith('/api/v1/telegram/channel-posts?') && entry.data && Array.isArray(entry.data.posts)) {
+        tgPages = [entry.data]; tgPageIndex = 0; renderTgChannelPage(); updateNavBar();
+        return;
+      }
+      replayResult = entry;
+      executeCurrentSearch();
+    }
+    function cancelActiveRequest(showMessage = true) {
+      if (!activeRequest) return;
+      activeRequest.abort(); activeRequest = null;
+      document.getElementById('submitBtn').disabled = false;
+      if (showMessage) document.getElementById('resultArea').innerHTML = `<div class="result-box"><strong>Search cancelled.</strong><p style="margin-top:6px;color:var(--text-muted)">You can start another search whenever you are ready.</p>${resultNavFooter()}</div>`;
+    }
     async function apiFetch(path, opts = {}) {
       const headers = Object.assign({ 'X-Visitor-Id': VISITOR_ID, 'X-UI-Client': '1' }, opts.headers || {});
-      const resp = await fetch(path, Object.assign({}, opts, { headers }));
-      const data = await resp.json().catch(() => ({ ok: false, error: 'Invalid server response' }));
+      if (replayResult && replayResult.path === path && !opts.method) {
+        const cached = replayResult.data; replayResult = null; return cached;
+      }
+      const fetchOpts = Object.assign({}, opts, { headers });
+      if (!fetchOpts.signal && activeRequest && (!opts.method || opts.method === 'GET')) fetchOpts.signal = activeRequest.signal;
+      const resp = await fetch(path, fetchOpts);
+      const data = await resp.json().catch(err => { if (err.name === 'AbortError') throw err; return { ok: false, error: 'Invalid server response' }; });
       if (!resp.ok && !data.needs_mtproto) {
         const err = new Error(data.error || data.detail || `HTTP ${resp.status}`);
         err.suggestions = data.suggestions || [];
         throw err;
       }
+      if (!opts.method || opts.method === 'GET') saveLocalResult(path, data);
       return data;
     }
 
@@ -943,6 +1009,7 @@
     }
 
     function goBack() {
+      cancelActiveRequest(false);
       if (!state.history.length) {
         goHome();
         return;
@@ -957,6 +1024,7 @@
     }
 
     function goHome() {
+      cancelActiveRequest(false);
       pushHistorySnapshot();
       state.tab = 'ig';
       state.action = 'profile';
@@ -967,6 +1035,7 @@
     }
 
     function switchTab(tab, pushHist = true) {
+      cancelActiveRequest(false);
       if (pushHist && (tab !== state.tab)) pushHistorySnapshot();
       state.tab = tab;
       if (PLATFORM_CONFIG[tab]) {
@@ -979,6 +1048,7 @@
     }
 
     function selectAction(actId) {
+      cancelActiveRequest(true);
       state.action = actId;
       renderChrome(false);
       document.getElementById('queryInput').focus();
@@ -1075,16 +1145,20 @@
     }
 
     function setLoading(msg = 'Fetching HD media...') {
+      if (activeRequest) activeRequest.abort();
+      activeRequest = new AbortController();
       document.getElementById('resultArea').innerHTML = `
         <div class="result-box loader-wrap">
           <div class="spinner"></div>
           <div style="font-weight:700;color:var(--text);">${esc(msg)}</div>
-          <div style="font-size:12.5px;margin-top:4px;">Connecting to upstream CDN in Full HD...</div>
+          <div style="font-size:12.5px;margin-top:4px;">Connecting to the service. This can take a moment.</div>
+          <button type="button" class="btn-ghost" style="margin-top:16px;" onclick="cancelActiveRequest()">✕ Cancel</button>
         </div>
       `;
     }
 
     function showError(err) {
+      if (err && err.name === 'AbortError') return;
       const sugs = (err.suggestions || []).map(s =>
         `<button class="chip" onclick="quickRun('${esc(s)}')">@${esc(s)}</button>`
       ).join(' ');
@@ -1156,6 +1230,7 @@
       } catch (err) {
         showError(err);
       } finally {
+        replayResult = null;
         btn.disabled = false;
         updateNavBar();
       }
@@ -1510,21 +1585,13 @@
         setLoading('Fetching Telegram Channel Media...');
         const d = await apiFetch(`/api/v1/telegram/post?url=${encodeURIComponent(q)}`);
         if (d.posts) {
-          // Returned list of recent channel posts
-          const cards = d.posts.map(p => `
-            <div class="picker-item" onclick="loadTgSinglePost('${esc(p.url)}')">
-              <div style="font-weight:700;">${esc(p.icon)} Post #${esc(p.post_id)}</div>
-              <div style="font-size:13px;color:var(--text-muted);">${esc(p.snippet || 'Media post')}</div>
-              <div style="font-size:12px;color:var(--accent);font-weight:700;">Download HD ➜</div>
-            </div>
-          `).join('');
-          document.getElementById('resultArea').innerHTML = `
-            <div class="result-box">
-              <h2>📢 @${esc(d.channel)} — Recent Media Posts</h2>
-              <div class="picker-grid">${cards || '<p style="color:var(--text-muted);">No public media posts found.</p>'}</div>
-              ${resultNavFooter()}
-            </div>
-          `;
+          tgPages = [d]; tgPageIndex = 0;
+          renderTgChannelPage();
+          return;
+        }
+        if (!d.items.length && d.caption) {
+          document.getElementById('resultArea').innerHTML = `<div class="result-box"><h2>✈️ @${esc(d.channel)} — Post #${esc(d.post_id)}</h2>${d.views ? `<p style="color:var(--text-muted);margin-top:8px">👁 ${esc(d.views)} views</p>` : ''}<div class="bio-box">${esc(d.caption)}</div><button class="btn-ghost" onclick="copyTgPostText()">Copy text</button>${resultNavFooter()}</div>`;
+          window.currentTgPostText = d.caption;
           return;
         }
         document.getElementById('resultArea').innerHTML = renderMediaGridHtml(
@@ -1570,6 +1637,37 @@
           ${resultNavFooter()}
         </div>
       `;
+    }
+
+    async function copyTgPostText() {
+      try { await navigator.clipboard.writeText(window.currentTgPostText || ''); alert('Text copied!'); }
+      catch (_) { alert('Copy is unavailable in this browser. Select the text to copy it.'); }
+    }
+    function renderTgChannelPage() {
+      const d = tgPages[tgPageIndex];
+      const cards = d.posts.map((p, i) => `
+        <article class="tg-post-card">
+          <div class="tg-post-top"><span>${esc(p.icon)} <strong>Post #${esc(p.post_id)}</strong></span><small>${esc(p.date ? p.date.slice(0,10) : '')} ${p.views ? ' · 👁 ' + esc(p.views) : ''}</small></div>
+          <div class="tg-post-text">${esc(p.text || 'No text in the public preview.')}</div>
+          ${p.preview_url ? (p.preview_is_video ? `<video class="tg-post-preview" src="${esc(p.preview_url)}" controls playsinline preload="none"></video>` : `<img class="tg-post-preview" src="${esc(p.preview_url)}" loading="lazy" alt="Post #${esc(p.post_id)} photo" />`) : ''}
+          <div class="tg-post-actions"><button class="btn-ghost" onclick="loadTgPostFromPage(${i})">${p.type === 'text' ? 'Open post' : 'View media & post'}</button><button class="btn-ghost" onclick="copyTgPageText(${i})">Copy text</button><a class="btn-ghost" href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">Open on Telegram ↗</a></div>
+        </article>`).join('');
+      document.getElementById('resultArea').innerHTML = `<div class="result-box"><div class="tg-list-head"><div><span class="eyebrow">PUBLIC CHANNEL</span><h2>📢 @${esc(d.channel)} — Channel posts</h2><p>Text, photos and videos available in Telegram’s public preview.</p></div><span class="tg-page-label">PAGE ${tgPageIndex + 1}</span></div><div class="tg-post-list">${cards || '<p>No more public posts found.</p>'}</div><div class="tg-pagination"><button class="btn-ghost" onclick="previousTgPage()" ${tgPageIndex === 0 ? 'disabled' : ''}>← Previous</button><span>Page ${tgPageIndex + 1}</span><button class="btn-primary" onclick="nextTgPage()" ${(!d.has_more && tgPageIndex + 1 >= tgPages.length) ? 'disabled' : ''}>Next →</button></div>${resultNavFooter()}</div>`;
+    }
+    function loadTgPostFromPage(i) { const p = tgPages[tgPageIndex]?.posts[i]; if (p) loadTgSinglePost(p.url); }
+    function copyTgPageText(i) { window.currentTgPostText = tgPages[tgPageIndex]?.posts[i]?.text || ''; copyTgPostText(); }
+    function previousTgPage() { if (tgPageIndex > 0) { tgPageIndex--; renderTgChannelPage(); document.getElementById('resultArea').scrollIntoView({behavior:'smooth'}); } }
+    async function nextTgPage() {
+      const current = tgPages[tgPageIndex];
+      if (tgPageIndex + 1 < tgPages.length) { tgPageIndex++; renderTgChannelPage(); return; }
+      if (!current.has_more || !current.next_before) return;
+      setLoading('Loading older Telegram posts...');
+      try {
+        const next = await apiFetch(`/api/v1/telegram/channel-posts?channel=${encodeURIComponent(current.channel)}&limit=10&before=${encodeURIComponent(current.next_before)}`);
+        if (!next.posts.length) { current.has_more = false; renderTgChannelPage(); return; }
+        tgPages.push(next); tgPageIndex++; renderTgChannelPage();
+        document.getElementById('resultArea').scrollIntoView({behavior:'smooth'});
+      } catch (e) { if (e.name !== 'AbortError') showError(e); }
     }
 
     async function subActionTg(uname, act) {
@@ -2125,6 +2223,7 @@
     renderChrome(true);
     updateNavBar();
     refreshHealthBadges();
+    renderLocalHistory();
   </script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a5e8d5520dad7f84',t:'MTc5NTM1OTkzNg=='};var l=window.parent.location,o;try{o=new URL(l.origin).origin}catch(e){try{o=new URL(new URL(l.href).origin).origin}catch(e){o=''}}var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a5e8d5520dad7f84',a=document.createElement('script');a.src=o?new URL(u,o).href:u;document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
