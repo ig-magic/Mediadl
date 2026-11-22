@@ -1,23 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "fastapi",
   "functions": {
-    "api/index.py": {
-      "maxDuration": 60
+    "main.py": {
+      "maxDuration": 60,
+      "includeFiles": "public/**"
     }
-  },
-  "rewrites": [
-    { "source": "/", "destination": "/index.html" },
-    { "source": "/api/(.*)", "destination": "/api/index.py" },
-    { "source": "/docs", "destination": "/api/index.py" },
-    { "source": "/redoc", "destination": "/api/index.py" },
-    { "source": "/openapi.json", "destination": "/api/index.py" },
-    {
-      "source": "/([^/]+)/(snap|snapchat|insta|ig|instagram|tg|telegram)/([^/]+)/(.*)",
-      "destination": "/api/index.py"
-    },
-    {
-      "source": "/([^/]+)/(snappic|snapdp|snapinfo|snapprofile|snapstory|snapstories|snaphighlights|snaphighlight|snapspotlight|snapspotlights|snapcode|instapic|instadp|igpic|igdp|instainfo|instaprofile|iginfo|instastory|instastories|igstory|instahighlights|instahighlight|ighighlights|instapost|instaposts|igpost|instareel|instareels|igreel|tgpic|tgdp|tginfo|tgprofile|tgstory|tgstories|tghighlights|tghighlight|tgpost|tgposts|tgchannel)/(.*)",
-      "destination": "/api/index.py"
-    }
-  ]
+  }
 }
