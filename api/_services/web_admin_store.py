@@ -40,7 +40,8 @@ class WebAdminTempStore:
         self.started_at = time.time()
         self.started_ist = now_ist_str()
 
-        self.admin_key: str = (os.getenv("ADMIN_KEY") or "7707859083").strip()
+        # Fail closed if no secret is configured; Telegram IDs are not passwords.
+        self.admin_key: str = (os.getenv("ADMIN_KEY") or "").strip()
         self.bot_token: str = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
         raw_ids = os.getenv("ADMIN_IDS", "7707859083")
         self.admin_ids: Set[int] = {
@@ -53,7 +54,8 @@ class WebAdminTempStore:
         self.env_api_keys: Set[str] = {
             k.strip() for k in raw_env_keys.replace(";", ",").split(",") if k.strip()
         }
-        self.env_api_keys.add(self.admin_key)
+        if self.admin_key:
+            self.env_api_keys.add(self.admin_key)
 
         self.live_tg_alerts: bool = True
         self.open_key_mode: bool = False  # False = validate against env + custom keys; True = accept any non-empty key
@@ -78,7 +80,7 @@ class WebAdminTempStore:
         if not key:
             return False
         k = key.strip()
-        return k == self.admin_key or (k.isdigit() and int(k) in self.admin_ids)
+        return bool(self.admin_key) and secrets.compare_digest(k.encode("utf-8"), self.admin_key.encode("utf-8"))
 
     def validate_api_key(self, api_key: Optional[str]) -> bool:
         """Validate `/{key}/...` path API key."""
