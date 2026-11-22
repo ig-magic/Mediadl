@@ -1,1447 +1,2130 @@
-"""
-Vercel Serverless + FastAPI Backend (`api/index.py`)
-====================================================
-Powers:
-  1. The 3-in-1 Social HD Downloader Web App (`/` -> `public/index.html`)
-  2. Public Developer REST API (`/api/v1/*`) + Swagger `/docs` & `/redoc`
-  3. CORS-Safe Media Streaming & 1-Click Force-Download Proxy (`/api/v1/proxy`)
-  4. Zero-DB `/tmp` Temp-File Admin Panel + Real-Time Telegram Admin Search Alerts
-"""
-
-from __future__ import annotations
-
-import asyncio
-import base64
-from collections import OrderedDict
-import hashlib
-import os
-import re
-import urllib.parse
-from typing import Any, Dict, List, Optional
-
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
-from pydantic import BaseModel
-import requests
-
-# Load local .env if present (and also check ../insta_dp_bot/.env in workspace so TG alerts work out of the box!)
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-load_dotenv(os.path.join(_ROOT, ".env"))
-_BOT_ENV = os.path.abspath(os.path.join(_ROOT, "..", "insta_dp_bot", ".env"))
-if os.path.exists(_BOT_ENV):
-    load_dotenv(_BOT_ENV, override=False)
-
-from ._services.instagram_service import (  # noqa: E402
-    InstagramFetchError,
-    InstagramLoginError,
-    InstagramService,
-    InvalidUsernameError,
-    MediaItem,
-    ProfileNotFoundError,
-    TwoFactorRequiredError,
-    classify_instagram_input,
-)
-from ._services.snapchat_service import (  # noqa: E402
-    SnapchatError,
-    SnapchatService,
-    parse_snapchat_input,
-)
-from ._services.telegram_service import (  # noqa: E402
-    TelegramFetchError,
-    TelegramMediaService,
-    classify_telegram_input,
-)
-from ._services.web_admin_store import WebAdminTempStore  # noqa: E402
-
-app = FastAPI(
-    title="3-in-1 Social HD Downloader API",
-    description=(
-        "Production REST API for downloading HD Profile Pictures (including Private IG & Dual Front/Background Snapchat DPs), "
-        "Active Stories, Highlights, Carousels, Reels, Spotlights, and Public Telegram Channel Media."
-    ),
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-ig_service = InstagramService()
-snap_service = SnapchatService()
-tg_service = TelegramMediaService()
-web_store = WebAdminTempStore()
-
-# Short-lived in-memory blob ring buffer (speeds up already-fetched avatars & MTProto story bytes)
-_BLOB_CACHE: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
-_MAX_BLOBS = 32
-
-ALLOWED_PROXY_HOSTS = (
-    "cdninstagram.com",
-    "fbcdn.net",
-    "akamaihd.net",
-    "instagram.com",
-    "socialhubapi.com",
-    "rapidcdn.app",
-    "sc-cdn.net",
-    "snapchat.com",
-    "telesco.pe",
-    "telegram.org",
-    "cdn-telegram.org",
-    "clipssaver.com",
-    "storynavigation.com",
-)
-
-
-def _store_blob(data: bytes, mime: str = "image/jpeg") -> str:
-    if not data:
-        return ""
-    if data[:8].startswith(b"\x89PNG"):
-        mime = "image/png"
-    elif len(data) > 12 and data[4:8] == b"ftyp":
-        mime = "video/mp4"
-    key = hashlib.sha1(data[:4096] + str(len(data)).encode()).hexdigest()[:16]
-    _BLOB_CACHE[key] = (data, mime)
-    _BLOB_CACHE.move_to_end(key)
-    while len(_BLOB_CACHE) > _MAX_BLOBS:
-        _BLOB_CACHE.popitem(last=False)
-    return f"/api/v1/blob/{key}"
-
-
-def _proxy_url(raw_url: str, filename: str = "media", dl: bool = False) -> str:
-    if not raw_url:
-        return ""
-    enc = urllib.parse.quote(raw_url, safe="")
-    fn = urllib.parse.quote(re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:60])
-    return f"/api/v1/proxy?url={enc}&filename={fn}" + ("&dl=1" if dl else "")
-
-
-def _serialize_media_item(m: MediaItem, prefix: str = "media", idx: int = 1) -> Dict[str, Any]:
-    ext = "mp4" if m.is_video else "jpg"
-    fname = f"{prefix}_{idx}.{ext}"
-    return {
-        "index": idx,
-        "is_video": bool(m.is_video),
-        "type": "video" if m.is_video else "image",
-        "raw_url": m.media_url,
-        "view_url": _proxy_url(m.media_url, fname, dl=False),
-        "download_url": _proxy_url(m.media_url, fname, dl=True),
-        "thumbnail_url": _proxy_url(m.thumbnail_url, f"{prefix}_{idx}_thumb.jpg", dl=False) if m.thumbnail_url else "",
-        "shortcode": m.shortcode or "",
-        "taken_at": m.taken_at,
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SocialGrab HD — 3-in-1 Instagram, Snapchat & Telegram Downloader + API</title>
+  <meta name="description" content="Download HD Profile Pictures (Private IG & Dual Snapchat Front+Background), Stories, Highlights, Carousels, Reels, Spotlights & Telegram Media with Public REST API." />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07090f;
+      --bg-elev: rgba(17, 22, 36, 0.78);
+      --bg-card: rgba(20, 27, 45, 0.85);
+      --bg-input: rgba(11, 15, 27, 0.92);
+      --border: rgba(148, 163, 184, 0.14);
+      --border-strong: rgba(148, 163, 184, 0.28);
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #ec4899;
+      --accent-2: #8b5cf6;
+      --accent-glow: rgba(236, 72, 153, 0.26);
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --radius-lg: 20px;
+      --radius-md: 14px;
+      --radius-sm: 10px;
     }
 
-
-def _req_meta(request: Request) -> tuple[str, str, str, str]:
-    forwarded = request.headers.get("x-forwarded-for", "")
-    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
-    ua = request.headers.get("user-agent", "")
-    vis = request.headers.get("x-visitor-id", "")
-    src = "Web UI" if request.headers.get("x-ui-client") == "1" else "REST API"
-    return ip, ua, vis, src
-
-
-def _log_req(request: Request, app_code: str, action: str, query_text: str, status: str) -> None:
-    if getattr(request.state, "skip_inner_log", False):
-        return
-    ip, ua, vis, src = _req_meta(request)
-    api_k = getattr(request.state, "path_api_key", "")
-    web_store.record_search(
-        client_ip=ip,
-        user_agent=ua,
-        visitor_tag=vis,
-        app_code=app_code,
-        action_label=action,
-        query_text=query_text,
-        status_text=status,
-        source=src,
-        api_key=api_k,
-    )
-
-
-# ===========================================================================
-# Global Error Handling (Zero Unhandled Crashes!)
-# ===========================================================================
-
-@app.exception_handler(ProfileNotFoundError)
-async def _not_found_handler(request: Request, exc: ProfileNotFoundError) -> JSONResponse:
-    web_store.bump_error()
-    return JSONResponse(
-        status_code=404,
-        content={"ok": False, "error": str(exc), "suggestions": getattr(exc, "suggestions", [])},
-    )
-
-
-@app.exception_handler(InstagramFetchError)
-async def _domain_err_handler(request: Request, exc: InstagramFetchError) -> JSONResponse:
-    web_store.bump_error()
-    return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
-
-
-@app.exception_handler(Exception)
-async def _unexpected_err_handler(request: Request, exc: Exception) -> JSONResponse:
-    web_store.bump_error()
-    return JSONResponse(
-        status_code=500,
-        content={"ok": False, "error": f"Request could not be completed: {str(exc)[:240]}"},
-    )
-
-
-# ===========================================================================
-# Frontend Entry (`/` -> `public/index.html`) & Health Check
-# ===========================================================================
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def serve_spa() -> Response:
-    html_path = os.path.join(_ROOT, "public", "index.html")
-    if os.path.exists(html_path):
-        return FileResponse(html_path, media_type="text/html")
-    return HTMLResponse("<h1>3-in-1 Social Downloader API is running.</h1>")
-
-
-@app.get("/api/v1/health", tags=["System"])
-async def api_health() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "service": "3-in-1 Social HD Downloader Web & API",
-        "version": "2.0.0",
-        "uptime": web_store.uptime_human(),
-        "platforms": {
-            "instagram": {
-                "ready": True,
-                "private_dp_zero_login": True,
-                "session_connected": bool(ig_service.session_id),
-                "logged_in_user": ig_service.logged_in_user,
-            },
-            "snapchat": {"ready": True, "dual_front_and_bg_dp": True, "zero_login": True},
-            "telegram": {
-                "ready": True,
-                "public_dp_and_channels": True,
-                "stories_mtproto_connected": tg_service.has_story_mtproto,
-                "mtproto_account": tg_service.logged_in_label,
-            },
-        },
+    body[data-theme="ig"] {
+      --accent: #f43f5e;
+      --accent-2: #d946ef;
+      --accent-glow: rgba(244, 63, 94, 0.24);
+    }
+    body[data-theme="snap"] {
+      --accent: #facc15;
+      --accent-2: #f97316;
+      --accent-glow: rgba(250, 204, 21, 0.22);
+    }
+    body[data-theme="tg"] {
+      --accent: #38bdf8;
+      --accent-2: #2563eb;
+      --accent-glow: rgba(56, 189, 248, 0.24);
+    }
+    body[data-theme="docs"] {
+      --accent: #10b981;
+      --accent-2: #6366f1;
+      --accent-glow: rgba(16, 185, 129, 0.22);
+    }
+    body[data-theme="admin"] {
+      --accent: #a855f7;
+      --accent-2: #ec4899;
+      --accent-glow: rgba(168, 85, 247, 0.24);
     }
 
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.55;
+      overflow-x: hidden;
+    }
 
-# ===========================================================================
-# CORS-Safe Media Streaming & Force-Download Proxy
-# ===========================================================================
+    /* Dynamic Ambient Aurora */
+    .aurora {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+      background:
+        radial-gradient(650px circle at 18% 12%, var(--accent-glow), transparent 60%),
+        radial-gradient(600px circle at 84% 16%, rgba(99, 102, 241, 0.14), transparent 60%),
+        radial-gradient(700px circle at 50% 95%, rgba(14, 165, 233, 0.08), transparent 65%);
+      transition: background 0.45s ease;
+    }
 
-@app.get("/api/v1/blob/{blob_id}", include_in_schema=False)
-async def serve_cached_blob(
-    blob_id: str,
-    dl: int = Query(0),
-    filename: str = Query("download"),
-    fallback: str = Query(""),
-) -> Response:
-    item = _BLOB_CACHE.get(blob_id)
-    if item:
-        data, mime = item
-        ext = "png" if "png" in mime else ("mp4" if "mp4" in mime else "jpg")
-        clean_fn = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:60]
-        if not clean_fn.endswith(f".{ext}"):
-            clean_fn = f"{clean_fn}.{ext}"
-        headers = {"Cache-Control": "public, max-age=3600"}
-        if dl:
-            headers["Content-Disposition"] = f'attachment; filename="{clean_fn}"'
-        return Response(content=data, media_type=mime, headers=headers)
+    .container {
+      position: relative;
+      z-index: 1;
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 20px 18px 72px;
+    }
 
-    if fallback:
-        return await proxy_media(url=fallback, dl=dl, filename=filename)
-    raise HTTPException(status_code=404, detail="Media cache expired; please search again.")
+    /* Top Header */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+      background: var(--bg-elev);
+      backdrop-filter: blur(18px);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 12px 18px;
+      margin-bottom: 22px;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .brand-logo {
+      width: 38px;
+      height: 38px;
+      border-radius: 11px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      display: grid;
+      place-items: center;
+      font-size: 19px;
+      font-weight: 800;
+      color: #090d16;
+      box-shadow: 0 6px 20px var(--accent-glow);
+    }
+    .brand-title { font-weight: 800; font-size: 17px; letter-spacing: -0.02em; }
+    .brand-sub { font-size: 11.5px; color: var(--text-muted); }
 
+    .nav-tabs {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      background: rgba(9, 13, 24, 0.75);
+      padding: 5px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+    }
+    .nav-tab {
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      padding: 8px 14px;
+      border-radius: 10px;
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .nav-tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.05); }
+    .nav-tab.active {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #080b12;
+      font-weight: 700;
+      box-shadow: 0 4px 16px var(--accent-glow);
+    }
 
-@app.get("/api/v1/proxy", tags=["Media Proxy"])
-async def proxy_media(
-    url: str = Query(..., description="Encoded upstream CDN media URL"),
-    dl: int = Query(0, description="Set dl=1 to force browser file download"),
-    filename: str = Query("social_hd_media", description="Suggested download filename"),
-) -> Response:
-    parsed = urllib.parse.urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme not in ("http", "https") or not any(
-        host == h or host.endswith("." + h) for h in ALLOWED_PROXY_HOSTS
-    ):
-        raise HTTPException(status_code=400, detail="Unsupported media host for proxy.")
+    /* Universal Back + Home Bar */
+    .crumb-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .nav-btns { display: flex; gap: 8px; align-items: center; }
+    .btn-ghost {
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 7px 13px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.18s ease;
+      text-decoration: none;
+    }
+    .btn-ghost:hover:not(:disabled) {
+      border-color: var(--border-strong);
+      background: rgba(255, 255, 255, 0.1);
+      transform: translateY(-1px);
+    }
+    .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
 
-    referer = "https://www.instagram.com/"
-    if "sc-cdn.net" in host or "snapchat.com" in host:
-        referer = "https://www.snapchat.com/"
-    elif "telesco.pe" in host or "telegram.org" in host:
-        referer = "https://t.me/"
-    elif "socialhubapi.com" in host or "clipssaver.com" in host:
-        referer = "https://clipssaver.com/"
+    .status-badges { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .pill-badge {
+      font-size: 12px;
+      padding: 5px 11px;
+      border-radius: 999px;
+      background: rgba(16, 185, 129, 0.12);
+      color: #34d399;
+      border: 1px solid rgba(52, 211, 153, 0.28);
+      font-weight: 600;
+      cursor: pointer;
+    }
 
-    def _fetch_stream(target_u: str, ref: str):
-        return requests.get(
-            target_u,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
-                ),
-                "Referer": ref,
-            },
-            stream=True,
-            timeout=28,
-        )
+    /* Hero Search Card */
+    .hero-card {
+      background: var(--bg-card);
+      backdrop-filter: blur(20px);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 26px 24px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+      margin-bottom: 24px;
+    }
+    .hero-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }
+    .hero-head h1 {
+      font-size: clamp(21px, 3vw, 27px);
+      font-weight: 800;
+      letter-spacing: -0.025em;
+    }
+    .hero-head p { color: var(--text-muted); font-size: 14px; margin-top: 4px; }
 
-    upstream = await asyncio.to_thread(_fetch_stream, url, referer)
-    # Fallback: if socialhubapi wrapper fails/expires, unwrap `?src=<base64>` directly to Instagram scontent CDN!
-    if upstream.status_code >= 400 and "src=" in (parsed.query or ""):
-        upstream.close()
-        try:
-            src_b64 = urllib.parse.parse_qs(parsed.query).get("src", [""])[0]
-            if src_b64:
-                src_b64 += "=" * (-len(src_b64) % 4)
-                unwrapped = base64.urlsafe_b64decode(src_b64).decode("utf-8")
-                if "cdninstagram.com" in unwrapped or "fbcdn.net" in unwrapped:
-                    upstream = await asyncio.to_thread(_fetch_stream, unwrapped, "https://www.instagram.com/")
-        except Exception:
-            pass
+    /* Sub-feature Action Pills */
+    .action-pills {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }
+    .action-pill {
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 9px 15px;
+      border-radius: 12px;
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.18s ease;
+    }
+    .action-pill:hover { color: var(--text); border-color: var(--border-strong); }
+    .action-pill.active {
+      color: var(--text);
+      border-color: var(--accent);
+      background: rgba(255, 255, 255, 0.07);
+      box-shadow: 0 0 0 1px var(--accent) inset, 0 6px 18px var(--accent-glow);
+    }
 
-    if upstream.status_code >= 400:
-        upstream.close()
-        raise HTTPException(status_code=502, detail=f"Upstream CDN HTTP {upstream.status_code}")
+    /* Search Input Row */
+    .search-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .search-wrap {
+      flex: 1;
+      min-width: 240px;
+      position: relative;
+      display: flex;
+      align-items: center;
+    }
+    .search-input {
+      width: 100%;
+      background: var(--bg-input);
+      border: 1.5px solid var(--border-strong);
+      color: var(--text);
+      padding: 14px 42px 14px 16px;
+      border-radius: 14px;
+      font-size: 15px;
+      outline: none;
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .search-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+    .clear-inp {
+      position: absolute;
+      right: 12px;
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 17px;
+      cursor: pointer;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #07090f;
+      border: none;
+      padding: 14px 24px;
+      border-radius: 14px;
+      font-size: 14.5px;
+      font-weight: 800;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: transform 0.16s ease, box-shadow 0.2s ease, opacity 0.2s;
+      text-decoration: none;
+      box-shadow: 0 8px 24px var(--accent-glow);
+    }
+    .btn-primary:hover:not(:disabled) { transform: translateY(-1px); }
+    .btn-primary:disabled { opacity: 0.6; cursor: wait; }
 
-    ctype = upstream.headers.get("Content-Type") or "application/octet-stream"
-    ext = "mp4" if "video" in ctype else ("png" if "png" in ctype else "jpg")
-    clean_fn = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:65]
-    if "." not in clean_fn[-5:]:
-        clean_fn = f"{clean_fn}.{ext}"
+    .quick-chips {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 13px;
+      font-size: 12.5px;
+      color: var(--text-muted);
+    }
+    .chip {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border);
+      color: #cbd5e1;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.16s;
+    }
+    .chip:hover { border-color: var(--accent); color: #fff; }
 
-    resp_headers = {"Cache-Control": "public, max-age=3600"}
-    if upstream.headers.get("Content-Length"):
-        resp_headers["Content-Length"] = upstream.headers["Content-Length"]
-    if dl:
-        resp_headers["Content-Disposition"] = f'attachment; filename="{clean_fn}"'
+    /* Result Cards & Grids */
+    .result-box {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 24px;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.36);
+      animation: fadeUp 0.25s ease;
+    }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
 
-    def _iter_chunks():
-        try:
-            for chunk in upstream.iter_content(chunk_size=65536):
-                if chunk:
-                    yield chunk
-        finally:
-            upstream.close()
+    .profile-layout {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 24px;
+      align-items: start;
+    }
+    @media (max-width: 740px) {
+      .profile-layout { grid-template-columns: 1fr; }
+    }
 
-    return StreamingResponse(_iter_chunks(), media_type=ctype, headers=resp_headers)
+    .dp-card {
+      background: rgba(10, 14, 25, 0.78);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 12px;
+      text-align: center;
+    }
+    .dp-card img {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: cover;
+      border-radius: 12px;
+      cursor: zoom-in;
+      background: #0b0f1c;
+      display: block;
+    }
+    .dp-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin: 9px 0 8px;
+    }
 
+    /* Snapchat Dual Front + Background Showcase */
+    .snap-dual-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
 
-# ===========================================================================
-# 1. INSTAGRAM REST API ENDPOINTS
-# ===========================================================================
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+      margin: 16px 0;
+    }
+    .stat-tile {
+      background: rgba(11, 15, 28, 0.8);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .stat-val { font-size: 19px; font-weight: 800; color: var(--text); }
+    .stat-lbl { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
 
-@app.get("/api/v1/instagram/profile", include_in_schema=False)
-async def api_ig_profile(
-    request: Request,
-    username: str = Query(..., description="Instagram username or profile URL"),
-) -> Dict[str, Any]:
-    try:
-        _, clean_u, _ = classify_instagram_input(username)
-        res = await asyncio.to_thread(ig_service.get_profile_pic, clean_u)
-        blob_path = _store_blob(res.image_bytes, "image/jpeg")
-        fb_enc = urllib.parse.quote(res.hd_pic_url, safe="")
-        view_u = f"{blob_path}?filename={res.username}_ig_hd&fallback={fb_enc}"
-        dl_u = f"{blob_path}?dl=1&filename={res.username}_ig_hd&fallback={fb_enc}"
-        _log_req(request, "ig", "Profile + HD DP", f"@{res.username}", "✅ Success")
-        return {
-            "ok": True,
-            "platform": "instagram",
-            "username": res.username,
-            "user_id": res.user_id,
-            "full_name": res.full_name,
-            "biography": res.biography,
-            "external_url": res.external_url,
-            "category": res.category,
-            "is_private": res.is_private,
-            "is_verified": res.is_verified,
-            "has_active_story": res.has_public_story,
-            "followers_count": res.followers_count,
-            "following_count": res.following_count,
-            "posts_count": res.posts_count,
-            "hd_profile_pic_raw": res.hd_pic_url,
-            "hd_profile_pic_view": view_u,
-            "hd_profile_pic_download": dl_u,
-            "size_kb": round(len(res.image_bytes) / 1024.0, 1),
+    .badge-row { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 6px; }
+    .tag {
+      font-size: 11.5px;
+      font-weight: 700;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid var(--border);
+    }
+    .tag.verified { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.35); }
+    .tag.priv { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.35); }
+    .tag.pub { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.35); }
+
+    .bio-box {
+      background: rgba(10, 14, 26, 0.65);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 13.5px;
+      white-space: pre-wrap;
+      color: #e2e8f0;
+      margin: 12px 0;
+    }
+
+    .quick-actions-grid {
+      display: flex;
+      gap: 9px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+
+    /* Media Grid (Stories / Highlights / Carousels / Spotlights) */
+    .media-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(235px, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+    .media-card {
+      background: rgba(10, 14, 25, 0.85);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .media-card img, .media-card video {
+      width: 100%;
+      height: 300px;
+      object-fit: cover;
+      background: #05070c;
+      display: block;
+    }
+    .media-card-foot {
+      padding: 11px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-top: auto;
+    }
+
+    /* Highlight / Post Picker List */
+    .picker-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .picker-item {
+      background: rgba(12, 17, 30, 0.85);
+      border: 1px solid var(--border);
+      border-radius: 13px;
+      padding: 14px;
+      cursor: pointer;
+      transition: all 0.18s ease;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .picker-item:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
+    }
+
+    /* Loader & Error Banner */
+    .loader-wrap {
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--text-muted);
+    }
+    .spinner {
+      width: 38px;
+      height: 38px;
+      border: 3px solid rgba(255, 255, 255, 0.12);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+      margin: 0 auto 14px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .err-card {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.35);
+      border-radius: 16px;
+      padding: 20px;
+      color: #fecaca;
+    }
+
+    /* API Docs Section */
+    .docs-endpoint {
+      background: rgba(11, 16, 29, 0.88);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px 20px;
+      margin-bottom: 16px;
+    }
+    .method-badge {
+      font-size: 11px;
+      font-weight: 800;
+      padding: 4px 9px;
+      border-radius: 7px;
+      background: rgba(16, 185, 129, 0.18);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .method-badge.post {
+      background: rgba(59, 130, 246, 0.18);
+      color: #60a5fa;
+      border-color: rgba(59, 130, 246, 0.35);
+    }
+    .ep-path {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13.5px;
+      color: #f1f5f9;
+      word-break: break-all;
+    }
+    pre.code-block {
+      background: #050811;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      overflow-x: auto;
+      font-size: 12.5px;
+      color: #cbd5e1;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin-top: 10px;
+      max-height: 340px;
+    }
+
+    /* Modals & Lightbox */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(3, 6, 14, 0.82);
+      backdrop-filter: blur(8px);
+      z-index: 90;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 18px;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal-card {
+      background: #101626;
+      border: 1px solid var(--border-strong);
+      border-radius: 20px;
+      max-width: 460px;
+      width: 100%;
+      padding: 24px;
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.6);
+    }
+    .form-field { margin-bottom: 13px; }
+    .form-field label { display: block; font-size: 12.5px; color: var(--text-muted); margin-bottom: 5px; }
+    .form-field input {
+      width: 100%;
+      background: var(--bg-input);
+      border: 1px solid var(--border-strong);
+      color: var(--text);
+      padding: 11px 13px;
+      border-radius: 10px;
+      font-size: 14px;
+    }
+
+    .table-scroll { overflow-x: auto; margin-top: 12px; }
+    table.adm-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.adm-table th, table.adm-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+    }
+    table.adm-table th { color: var(--text-muted); font-weight: 600; font-size: 12px; }
+    .hidden { display: none !important; }
+    /* Light, service-portal-inspired visual system */
+    :root, body[data-theme] { color-scheme:light; --bg:#f2f6fc; --bg-elev:#fff; --bg-card:#fff; --bg-input:#fff; --border:#dce7f3; --border-strong:#c5d6e9; --text:#193657; --text-muted:#6c7f94; --accent:#215da9; --accent-2:#174a8b; --accent-glow:rgba(33,93,169,.12); --radius-lg:11px; --radius-md:8px; }
+    body {background:#f2f6fc;color:var(--text);font-family:Inter,"Segoe UI",Arial,sans-serif;font-size:14px}
+    button,input {font:inherit} button:focus-visible,a:focus-visible,input:focus-visible {outline:3px solid #7caff0;outline-offset:3px}
+    .utility-bar {height:32px;background:#0c2d60;color:#d9e9fb;display:flex;align-items:center;justify-content:space-between;padding:0 36px;font-size:11px;letter-spacing:.03em}
+    .utility-bar i,.green-dot {display:inline-block;width:6px;height:6px;border-radius:50%;background:#88bfff;margin-right:8px;vertical-align:middle}
+    .site-header {height:90px;background:#174a8b;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 36px;gap:20px}
+    .brand {border:0;background:none;color:white;text-align:left;display:flex;align-items:center;gap:13px;padding:0}
+    .brand-logo {width:53px;height:53px;border-radius:8px;background:white;color:#1b5599;box-shadow:none}
+    .brand-title {display:block;font:700 23px Georgia,serif;letter-spacing:-.03em}
+    .brand-sub {display:block;font-size:12px;color:#cde0fa;margin-top:4px}
+    .header-right {display:flex;align-items:center;gap:28px}.portal-label {font-size:10px;letter-spacing:.15em;color:#c1d9f8}.header-button {border:1px solid #ffffff66;background:transparent;border-radius:7px;padding:11px 15px;color:#fff;font-size:12px;font-weight:600;cursor:pointer}.header-button span {margin-left:15px;color:#c9def5}
+    .page-shell {display:grid;grid-template-columns:230px minmax(0,1fr);min-height:calc(100vh - 122px)}
+    .sidebar {background:white;border-right:1px solid var(--border);padding:31px 16px;display:flex;flex-direction:column}
+    .sidebar-label {font-size:9px;color:#8392a1;letter-spacing:.17em;font-weight:800;padding:0 13px;margin-bottom:12px}.side-section {margin-top:30px}
+    .nav-tabs {background:none;border:0;border-radius:0;padding:0;display:flex;flex-direction:column;gap:4px}
+    .nav-tab,.side-home {width:100%;display:flex;align-items:center;gap:12px;text-align:left;padding:11px 13px;color:#6a7c90;font-size:13px;border-radius:7px;background:none;border:0;cursor:pointer;box-shadow:none}
+    .nav-tab span,.side-home span {width:20px;font-size:18px;line-height:1;color:#6689b3;text-align:center}.nav-tab:hover,.side-home:hover {background:#eff5fc;color:#174a8b}.nav-tab.active {background:#215da9;color:#fff;box-shadow:none}.nav-tab.active span {color:#fff}
+    .sidebar-note {margin:48px 2px 0;background:#eef5fd;border:1px solid #dceaf9;border-radius:9px;padding:17px;color:#23466e}.side-note-icon {font-size:23px;color:#3878c2;margin-bottom:9px}.sidebar-note strong {font-size:12px}.sidebar-note p {font-size:11px;line-height:1.7;color:#74879c;margin:7px 0 12px}.sidebar-note button {background:none;border:0;color:#215da9;font-weight:700;font-size:11px;cursor:pointer}.sidebar-note button span {margin-left:8px}.side-footer {margin-top:auto;padding:35px 10px 0;font-size:9px;letter-spacing:.12em;color:#9aaabc}.side-footer span {color:#70a1da}
+    .container {max-width:1500px;width:100%;padding:27px 38px 34px;margin:0 auto;min-width:0}
+    .crumb-bar {margin-bottom:25px;gap:12px}.nav-btns {flex-wrap:wrap}.btn-ghost {background:#fff;color:#426383;border:1px solid #dbe6f1;border-radius:7px;box-shadow:none;font-size:12px}.btn-ghost:hover:not(:disabled) {background:#f0f6fd;border-color:#a6c5e7;color:#164a88}.status-badges {gap:5px}.pill-badge {background:#eaf4f0;color:#39775d;border:1px solid #d2eadf;font-size:11px;padding:5px 9px}
+    .page-heading {display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:25px;gap:15px}.eyebrow {font-size:9px;letter-spacing:.17em;font-weight:800;color:#4674a8}.page-heading h1 {font:400 clamp(29px,3vw,38px)/1.2 Georgia,serif;color:#17375e;margin:7px 0}.page-heading h1 span {color:#2a72c2}.page-heading p,.section-intro p,.guide-heading p {color:#75889d;font-size:12px}.heading-tag {font-size:9px;letter-spacing:.11em;font-weight:700;color:#8192a3;white-space:nowrap}.green-dot {background:#4bb899}
+    .portal-hero {border-radius:12px;min-height:285px;background:linear-gradient(110deg,#103a7b 0%,#1958af 65%,#2d78d3 100%);position:relative;overflow:hidden;color:#fff;display:flex;align-items:center}
+    .portal-hero-content {position:relative;z-index:1;padding:35px 37px;width:66%}.hero-kicker {font-size:9px;letter-spacing:.17em;color:#d0e5ff;font-weight:700;margin-bottom:16px}.hero-kicker span {display:inline-block;background:#9acaff;width:5px;height:5px;border-radius:50%;margin-right:8px}.portal-hero h2 {font:400 clamp(30px,3vw,42px)/1.15 Georgia,serif;letter-spacing:-.03em}.portal-hero h2 em {font-style:normal;color:#d4e8ff}.portal-hero p {font-size:12px;line-height:1.8;color:#d7e8ff;margin:14px 0 20px}.portal-hero button {background:white;border:0;color:#174a8b;font-weight:700;font-size:11px;border-radius:6px;padding:12px 15px;cursor:pointer}.portal-hero button span {margin-left:16px}.portal-hero a {font-size:11px;text-decoration:none;color:#e4efff;margin-left:22px}.portal-hero a span {margin-left:8px}
+    .hero-art {position:absolute;right:0;top:0;width:36%;height:100%;display:grid;place-items:center;overflow:hidden;color:#d5eaff}.hero-art svg {width:190px;z-index:1;opacity:.78}.hero-art>span {position:absolute;bottom:26px;font-size:8px;letter-spacing:.17em;color:#c3dcf7}.orbit {position:absolute;border:1px solid #c1dfff35;border-radius:50%;width:330px;height:330px}.orbit-two {width:250px;height:250px}.art-grid {position:absolute;inset:0;background-image:linear-gradient(#c1dfff10 1px,transparent 1px),linear-gradient(90deg,#c1dfff10 1px,transparent 1px);background-size:32px 32px;mask-image:radial-gradient(circle,#000,transparent)}
+    .section-intro {display:flex;align-items:flex-end;justify-content:space-between;margin:34px 0 16px}.section-intro h2,.guide-heading h2 {font:400 27px Georgia,serif;color:#1a3b60;margin:6px 0}.section-counter {color:#9aaec4;font-size:11px;letter-spacing:.1em}
+    .hero-card,.result-box,.docs-endpoint {background:#fff;backdrop-filter:none;box-shadow:0 3px 18px #174a8b08;border:1px solid #dce7f3;border-radius:10px}.hero-card {padding:24px;margin-bottom:20px}.hero-head h1 {font-size:18px;font-weight:700;color:#183b63}.hero-head p {font-size:12px;line-height:1.7}.hero-head {margin-bottom:21px}.field-label {font-size:9px;letter-spacing:.14em;font-weight:800;color:#8090a2;margin:16px 0 10px}
+    .action-pill {background:#f6f9fd;border:1px solid #dce7f3;color:#59728d;border-radius:7px;padding:9px 13px;font-size:12px;box-shadow:none}.action-pill:hover {background:#eaf3fc;color:#1d5795}.action-pill.active {background:#e8f1fc;color:#1d5795;border-color:#87b4e5;box-shadow:none}
+    .search-input {background:#fff;border:1px solid #cbdbea;border-radius:7px;color:#183b63;padding:13px 40px 13px 15px;font-size:13px}.search-input::placeholder {color:#a2b1c0}.btn-primary {background:#215da9;color:#fff;border-radius:7px;padding:13px 20px;font-size:12px;box-shadow:none}.btn-primary:hover:not(:disabled) {background:#174b8e}.quick-chips {font-size:11px}.chip {background:#f4f8fd;color:#527293;border:1px solid #dce7f3;font-size:11px}.chip:hover {color:#174a8b;background:#eaf2fc}
+    .guide-heading {margin:34px 0 16px}.picker-grid {grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:0}.picker-item {background:#fff;border:1px solid #dce7f3;border-radius:9px;padding:18px 16px;min-height:150px;box-shadow:0 3px 12px #174a8b05}.picker-item:hover {border-color:#8db9ed;box-shadow:0 8px 22px #174a8b12}.picker-item>div:first-child {display:grid;place-items:center;width:39px;height:39px;background:#edf4fd;border-radius:8px;font-size:19px!important}.picker-item>div:nth-child(2) {color:#1d4169;font-size:13px}.picker-item>div:nth-child(3) {line-height:1.6;font-size:11px!important}
+    .dp-card,.stat-tile,.bio-box,.media-card {background:#f5f9fd;color:var(--text);border-color:#dce7f3}.bio-box {color:#435e79}.dp-card img {background:#e7eff8}.stat-val {color:#1c456f}.err-card {background:#fff3f3;color:#9c3030;border-color:#f1c6c6;border-radius:9px}.spinner {border-color:#dce9f7;border-top-color:#215da9}.ep-path {color:#1f4f83}.method-badge {color:#087957}.method-badge.post {color:#215da9}.modal-card {background:#fff;color:#193657;box-shadow:0 25px 60px #092b5060;border-radius:12px}.tag.pub {color:#167b57}.tag.priv {color:#a76b08}.tag.verified {color:#1870a8}
+    .page-footer {margin-top:45px;padding-top:19px;border-top:1px solid #dce7f3;display:flex;justify-content:space-between;gap:12px;font-size:10px;color:#95a6b8}
+    @media(max-width:1100px){.picker-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.container{padding-left:26px;padding-right:26px}}
+    @media(max-width:760px){.utility-bar{padding:0 18px}.utility-bar span:last-child,.portal-label,.sidebar-note,.side-footer,.sidebar-label,.heading-tag {display:none}.site-header{height:76px;padding:0 18px}.brand-logo{width:45px;height:45px}.brand-title{font-size:19px}.header-button{padding:9px}.page-shell{display:block}.sidebar{padding:9px 14px;display:flex;flex-direction:row;gap:5px;overflow-x:auto;border-right:0;border-bottom:1px solid #dce7f3}.side-home{width:auto;white-space:nowrap;padding:9px}.nav-tabs{flex-direction:row;flex-wrap:nowrap}.nav-tab{width:auto;white-space:nowrap;padding:9px}.nav-tab span,.side-home span{font-size:16px}.container{padding:20px 16px 28px}.crumb-bar{margin-bottom:20px}.page-heading{margin-bottom:18px}.portal-hero{min-height:250px}.portal-hero-content{padding:28px 24px;width:75%}.hero-art{width:35%;opacity:.55}.hero-art svg{width:135px}.hero-art>span{display:none}.hero-kicker{font-size:8px}.section-intro{margin-top:26px}.page-footer{flex-direction:column}.search-wrap{min-width:0;flex-basis:100%}.search-row>.btn-primary{width:100%}}
+    @media(max-width:430px){.utility-bar span:last-child{display:none}.picker-grid{grid-template-columns:1fr 1fr}.picker-item{padding:13px;min-height:160px}.portal-hero-content{width:100%}.hero-art{opacity:.16;width:55%}.portal-hero h2{font-size:32px}.status-badges{margin-top:3px}.hero-card{padding:18px}}
+
+  </style>
+</head>
+<body data-theme="ig">
+  <div class="utility-bar"><span><i></i> SocialGrab online services</span><span>One place for your social media tools</span></div>
+  <header class="site-header">
+    <button class="brand" onclick="goHome()" aria-label="SocialGrab home">
+      <span class="brand-logo"><svg viewBox="0 0 40 40" width="34" height="34" fill="none" aria-hidden="true"><rect x="5" y="5" width="30" height="30" rx="9" stroke="currentColor" stroke-width="2"/><path d="M20 10v15m-6-6 6 6 6-6M12 30h16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span><span class="brand-title">SocialGrab HD</span><span class="brand-sub">Your social media toolkit</span></span>
+    </button>
+    <div class="header-right"><span class="portal-label">SOCIAL MEDIA SERVICES PORTAL</span><button class="header-button" onclick="switchTab('docs')">Developer API <span>↗</span></button></div>
+  </header>
+  <div class="page-shell">
+    <aside class="sidebar" aria-label="Portal navigation">
+      <div class="sidebar-label">WORKSPACE</div>
+      <button class="side-home" onclick="goHome()"><span>▦</span> Overview</button>
+      <div class="sidebar-label side-section">PLATFORMS</div>
+      <nav class="nav-tabs" aria-label="Platforms">
+        <button class="nav-tab active" data-tab="ig" onclick="switchTab('ig')"><span>◎</span> Instagram</button>
+        <button class="nav-tab" data-tab="snap" onclick="switchTab('snap')"><span>◉</span> Snapchat</button>
+        <button class="nav-tab" data-tab="tg" onclick="switchTab('tg')"><span>✈</span> Telegram</button>
+        <button class="nav-tab" data-tab="docs" onclick="switchTab('docs')"><span>⌘</span> API Docs</button>
+        <button class="nav-tab" data-tab="admin" onclick="switchTab('admin')"><span>◇</span> Admin</button>
+      </nav>
+      <div class="sidebar-note"><div class="side-note-icon">✧</div><strong>Everything in one place.</strong><p>Find the right tool and get started in a few simple steps.</p><button onclick="switchTab('docs')">Explore API <span>→</span></button></div>
+      <div class="side-footer">SOCIALGRAB HD <span>•</span> MEDIA TOOLS</div>
+    </aside>
+  <div class="container">
+    <!-- UNIVERSAL BACK + MAIN MENU NAVIGATION BAR -->
+    <div class="crumb-bar">
+      <div class="nav-btns">
+        <button class="btn-ghost" id="backBtn" onclick="goBack()" disabled>⬅️ Back</button>
+        <button class="btn-ghost" onclick="goHome()">🏠 Main Menu</button>
+        <span id="crumbLabel" style="font-size:13px;color:var(--text-muted);margin-left:4px;">📸 Instagram ➜ Profile + HD DP</span>
+      </div>
+      <div class="status-badges">
+        <span class="pill-badge" id="igAuthBadge" onclick="openIgModal()" title="Manage Instagram Session">🔐 IG: Zero-Login Ready</span>
+        <span class="pill-badge" id="tgAuthBadge" onclick="openTgModal()" title="Unlock Telegram Stories">✈️ TG Stories: Setup</span>
+      </div>
+    </div>
+
+    <!-- DOWNLOADER VIEW (IG / SNAP / TG) -->
+    <main id="downloaderSection">
+      <div class="page-heading"><div><span class="eyebrow">YOUR SOCIAL TOOLKIT, CONNECTED</span><h1>Social media services<span>.</span></h1><p>Everything you need to access and save social media, in one place.</p></div><div class="heading-tag"><span class="green-dot"></span> YOUR DOWNLOAD WORKSPACE</div></div>
+      <section class="portal-hero" aria-label="Welcome to SocialGrab">
+        <div class="portal-hero-content"><div class="hero-kicker"><span></span> YOUR CONTENT, MADE SIMPLE</div><h2>Less searching.<br><em>More saving.</em></h2><p>From a profile picture to your favourite media,<br> find the right tool and take the next step.</p><button onclick="document.getElementById('queryInput').focus(); document.getElementById('tool-section').scrollIntoView({behavior:'smooth',block:'center'})">Explore the tools <span>↗</span></button><a href="#services-guide">How it works <span>→</span></a></div>
+        <div class="hero-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="art-grid"></div><svg viewBox="0 0 210 180" fill="none"><rect x="60" y="13" width="90" height="150" rx="19" stroke="currentColor" stroke-width="2"/><rect x="70" y="27" width="70" height="111" rx="8" stroke="currentColor" stroke-width="1.4"/><path d="M92 17h26M98 150h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="105" cy="61" r="14" stroke="currentColor" stroke-width="1.5"/><path d="M82 108c4-15 13-22 23-22s19 7 23 22M39 49l8 8m-8 0 8-8m121 57h14m-7-7v14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg><span>SOCIALGRAB · DOWNLOADS MADE EASY</span></div>
+      </section>
+      <div class="section-intro" id="tool-section"><div><span class="eyebrow">ONLINE TOOLS</span><h2>How can we help you?</h2><p>Choose a service, enter a username or link, and get started.</p></div><span class="section-counter">01 / 03</span></div>
+      <section class="hero-card">
+        <div class="hero-head">
+          <div>
+            <h1 id="heroTitle">📸 Instagram HD Downloader</h1>
+            <p id="heroSub">Full Profile Info + 1080p HD DP (Public &amp; Private!), Stories, Highlights, Carousels &amp; HD Reels.</p>
+          </div>
+        </div>
+
+        <!-- Dedicated Sub-Action Buttons -->
+        <div class="field-label">SELECT A SERVICE</div><div class="action-pills" id="actionPills"></div>
+
+        <!-- Input Form -->
+        <div class="field-label">USERNAME OR LINK</div>
+        <form class="search-row" onsubmit="handleSearchSubmit(event)">
+          <div class="search-wrap">
+            <input
+              type="text"
+              id="queryInput"
+              class="search-input"
+              placeholder="Enter Instagram username (e.g. virat.kohli) or paste link..."
+              autocomplete="off"
+              required
+            />
+            <button type="button" class="clear-inp" onclick="document.getElementById('queryInput').value='';document.getElementById('queryInput').focus();" title="Clear">×</button>
+          </div>
+          <button type="submit" class="btn-primary" id="submitBtn">⚡ Fetch HD</button>
+        </form>
+
+        <!-- Quick Try Chips -->
+        <div class="quick-chips" id="quickChips"></div>
+      </section>
+
+      <!-- Dynamic Result Area -->
+      <section id="resultArea"></section>
+    </main>
+
+    <!-- DEVELOPER API DOCS SECTION -->
+    <section id="docsSection" class="hidden">
+      <div class="hero-card">
+        <div class="hero-head">
+          <div>
+            <h1>📖 Clean Path-Based Developer API</h1>
+            <p>Simple URL format: <code>Website/(key)/(snap|insta|tg)/(pic|info|story|highlights|post)/(query)</code> + 1-word shorthands (<code>snappic</code>, <code>instapic</code>, <code>tgpic</code>...)</p>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <a href="/docs" target="_blank" class="btn-ghost">⚡ Swagger UI (/docs)</a>
+            <a href="/redoc" target="_blank" class="btn-ghost">📘 ReDoc (/redoc)</a>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-tile">
+            <div class="stat-lbl">Website Base URL</div>
+            <div class="stat-val" id="baseUrlDisplay" style="font-size:13.5px;word-break:break-all;color:#176e58;">https://website.com</div>
+          </div>
+          <div class="stat-tile">
+            <div class="stat-lbl">🔑 Active API Key (Editable)</div>
+            <input id="docsApiKeyInput" value="demo" oninput="renderApiDocs()" style="margin-top:4px;width:100%;background:var(--bg-input);border:1px solid var(--border-strong);color:#215da9;font-weight:700;padding:6px 10px;border-radius:8px;font-family:monospace;" />
+          </div>
+          <div class="stat-tile">
+            <div class="stat-lbl">Direct Binary Image Mode</div>
+            <div class="stat-val" style="font-size:13.5px;">Add <code>?direct=1</code> on <code>/pic/</code></div>
+          </div>
+        </div>
+
+        <div class="action-pills" id="docsFilterPills" style="margin-bottom:0;margin-top:10px;"></div>
+      </div>
+
+      <div id="apiEndpointsContainer"></div>
+    </section>
+
+    <!-- ADMIN PANEL SECTION (ZERO-DB /tmp FILE) -->
+    <section id="adminSection" class="hidden">
+      <div class="hero-card" id="adminLockCard">
+        <h2 style="margin-bottom:8px;">👑 Admin Control Panel (Zero-DB `/tmp` Mode)</h2>
+        <p style="color:var(--text-muted);font-size:14px;margin-bottom:16px;">
+          View live bot/website analytics, visitor details, and every single search history stored in <code>/tmp</code> (no database!).
+        </p>
+        <form class="search-row" onsubmit="unlockAdmin(event)">
+          <div class="search-wrap">
+            <input type="password" id="adminKeyInput" class="search-input" placeholder="Enter Admin ID / Key (e.g. your Telegram Admin ID)..." required />
+          </div>
+          <button type="submit" class="btn-primary">🔓 Open Admin Panel</button>
+        </form>
+      </div>
+
+      <div id="adminDashboard" class="hidden"></div>
+    </section>
+    <footer class="page-footer"><span>© SocialGrab HD · Social media tools</span><span>Made for your everyday downloads</span></footer>
+  </div>
+  </div>
+
+  <!-- INSTAGRAM LOGIN MODAL -->
+  <div class="modal-backdrop" id="igModal">
+    <div class="modal-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h3>🔐 Instagram Session Login</h3>
+        <button class="btn-ghost" onclick="closeModals()">✕</button>
+      </div>
+      <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">
+        Public &amp; Private HD Profile Pics work without login! Connect an Instagram account only if you want to download Stories/Posts from private accounts you follow.
+      </p>
+      <div id="igLoginStep1">
+        <div class="form-field">
+          <label>Instagram Username</label>
+          <input type="text" id="igUserInp" placeholder="your_ig_username" />
+        </div>
+        <div class="form-field">
+          <label>Instagram Password (never stored; saved as session in /tmp)</label>
+          <input type="password" id="igPassInp" placeholder="••••••••" />
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;">
+          <button class="btn-ghost" onclick="igLogout()">Logout</button>
+          <button class="btn-primary" onclick="submitIgLogin()">Connect Instagram</button>
+        </div>
+      </div>
+      <div id="igLoginStep2" class="hidden">
+        <div class="form-field">
+          <label>📲 Enter 6-Digit 2FA OTP Code</label>
+          <input type="text" id="ig2faInp" placeholder="123456" />
+        </div>
+        <button class="btn-primary" style="width:100%;" onclick="submitIg2fa()">Verify 2FA</button>
+      </div>
+      <div id="igModalMsg" style="margin-top:10px;font-size:13px;"></div>
+    </div>
+  </div>
+
+  <!-- TELEGRAM MTPROTO STORY UNLOCK MODAL -->
+  <div class="modal-backdrop" id="tgModal">
+    <div class="modal-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h3>✈️ Unlock Telegram Stories (MTProto)</h3>
+        <button class="btn-ghost" onclick="closeModals()">✕</button>
+      </div>
+      <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">
+        Public Telegram DPs &amp; Channel Posts work instantly with zero login! To download User Stories &amp; Pinned Highlights, connect your free <a href="https://my.telegram.org" target="_blank" style="color:#38bdf8;">my.telegram.org</a> API credentials:
+      </p>
+      <div id="tgStep1">
+        <div class="form-field">
+          <label>App api_id (numeric)</label>
+          <input type="number" id="tgApiId" placeholder="12345678" />
+        </div>
+        <div class="form-field">
+          <label>App api_hash</label>
+          <input type="text" id="tgApiHash" placeholder="32-character hash" />
+        </div>
+        <div class="form-field">
+          <label>Phone Number (with country code)</label>
+          <input type="text" id="tgPhone" placeholder="+919876543210" />
+        </div>
+        <button class="btn-primary" style="width:100%;" onclick="startTgMtproto()">Send Telegram OTP</button>
+      </div>
+      <div id="tgStep2" class="hidden">
+        <div class="form-field">
+          <label>📲 Telegram OTP Code</label>
+          <input type="text" id="tgOtp" placeholder="1 2 3 4 5" />
+        </div>
+        <button class="btn-primary" style="width:100%;" onclick="verifyTgOtp()">Verify OTP</button>
+      </div>
+      <div id="tgStep3" class="hidden">
+        <div class="form-field">
+          <label>🔐 Telegram 2FA Cloud Password</label>
+          <input type="password" id="tg2faPass" placeholder="Cloud Password" />
+        </div>
+        <button class="btn-primary" style="width:100%;" onclick="verifyTg2fa()">Complete Setup</button>
+      </div>
+      <div id="tgModalMsg" style="margin-top:10px;font-size:13px;"></div>
+    </div>
+  </div>
+
+  <!-- IMAGE LIGHTBOX -->
+  <div class="modal-backdrop" id="lightboxModal" onclick="closeModals()">
+    <img id="lightboxImg" src="" alt="HD Preview" style="max-width:94vw;max-height:90vh;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,0.8);" />
+  </div>
+
+  <script>
+    // Persistent anonymous visitor tag for Admin Search History grouping
+    const VISITOR_ID = (() => {
+      let v = localStorage.getItem('sg_visitor_id');
+      if (!v) {
+        v = 'v_' + Math.random().toString(36).slice(2, 10);
+        localStorage.setItem('sg_visitor_id', v);
+      }
+      return v;
+    })();
+
+    const PLATFORM_CONFIG = {
+      ig: {
+        title: '📸 Instagram HD Downloader',
+        sub: 'Unlimited Zero-Login HD DP (Public & Private Accounts!), Active Stories, Highlights, Carousels & HD Reels.',
+        actions: [
+          { id: 'profile', label: '👤 Profile + HD DP', placeholder: 'Enter Instagram username (e.g. virat.kohli) or profile URL...' },
+          { id: 'stories', label: '⭕ Active Stories', placeholder: 'Enter Instagram username for 24h Stories (e.g. instagram)...' },
+          { id: 'highlights', label: '✨ Highlights', placeholder: 'Enter Instagram username for Story Highlights...' },
+          { id: 'post', label: '📸 Post / Carousel', placeholder: 'Paste Instagram Post URL (/p/...) or enter username to browse...' },
+          { id: 'reels', label: '🎬 HD Reels', placeholder: 'Paste Reel URL (/reel/...) or enter username to browse Reels...' }
+        ],
+        chips: ['virat.kohli', 'instagram', 'priya.sharma.x', 'cristiano']
+      },
+      snap: {
+        title: '👻 Snapchat HD Downloader (Zero-Login)',
+        sub: 'Fetches BOTH Front Profile Pic + Background Cover Pic in HD, Active 24h Stories, Curated Highlights & Spotlights!',
+        actions: [
+          { id: 'profile', label: '👤 Front + BG HD DP', placeholder: 'Enter Snapchat username (e.g. khloekardashian, charlidamelio, mrbeast)...' },
+          { id: 'stories', label: '⭕ Snap Stories (24h)', placeholder: 'Enter Snapchat username for active Stories (e.g. khloekardashian)...' },
+          { id: 'highlights', label: '✨ Snap Highlights', placeholder: 'Enter Snapchat username for Story Highlights...' },
+          { id: 'spotlight', label: '🔥 Spotlight Video', placeholder: 'Paste Snapchat Spotlight link or username (e.g. mrbeast)...' },
+          { id: 'snapcode', label: '🟨 Snapcode QR', placeholder: 'Enter Snapchat username for 1000×1000 PNG Snapcode...' }
+        ],
+        chips: ['khloekardashian', 'charlidamelio', 'mrbeast', 'kyliejenner']
+      },
+      tg: {
+        title: '✈️ Telegram HD Downloader',
+        sub: 'Download Public User/Channel/Group HD DP + Bio + Subscribers, Channel Media Posts, and MTProto Stories & Highlights.',
+        actions: [
+          { id: 'profile', label: '👤 User / Channel HD DP', placeholder: 'Enter Telegram @username or t.me link (e.g. durov, telegram)...' },
+          { id: 'post', label: '📢 Channel Post Media', placeholder: 'Paste t.me/channel/123 link OR enter channel username (e.g. telegram)...' },
+          { id: 'stories', label: '⭕ Active TG Stories', placeholder: 'Enter Telegram username or t.me/user/s/1 link...' },
+          { id: 'highlights', label: '📌 Pinned Highlights', placeholder: 'Enter Telegram username for Pinned Story Highlights...' }
+        ],
+        chips: ['durov', 'telegram', 'https://t.me/telegram/459']
+      }
+    };
+
+    let state = {
+      tab: 'ig',
+      action: 'profile',
+      history: [],
+      adminKey: sessionStorage.getItem('sg_admin_key') || ''
+    };
+
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+    }
+
+    function fmtNum(n) {
+      if (n === null || n === undefined) return '—';
+      if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e4) return (n / 1e3).toFixed(1) + 'K';
+      return Number(n).toLocaleString();
+    }
+
+    async function apiFetch(path, opts = {}) {
+      const headers = Object.assign({ 'X-Visitor-Id': VISITOR_ID, 'X-UI-Client': '1' }, opts.headers || {});
+      const resp = await fetch(path, Object.assign({}, opts, { headers }));
+      const data = await resp.json().catch(() => ({ ok: false, error: 'Invalid server response' }));
+      if (!resp.ok && !data.needs_mtproto) {
+        const err = new Error(data.error || data.detail || `HTTP ${resp.status}`);
+        err.suggestions = data.suggestions || [];
+        throw err;
+      }
+      return data;
+    }
+
+    function pushHistorySnapshot() {
+      const resultHtml = document.getElementById('resultArea').innerHTML;
+      state.history.push({
+        tab: state.tab,
+        action: state.action,
+        query: document.getElementById('queryInput').value,
+        resultHtml
+      });
+      if (state.history.length > 25) state.history.shift();
+      updateNavBar();
+    }
+
+    function goBack() {
+      if (!state.history.length) {
+        goHome();
+        return;
+      }
+      const prev = state.history.pop();
+      state.tab = prev.tab;
+      state.action = prev.action;
+      renderChrome(false);
+      document.getElementById('queryInput').value = prev.query || '';
+      document.getElementById('resultArea').innerHTML = prev.resultHtml || '';
+      updateNavBar();
+    }
+
+    function goHome() {
+      pushHistorySnapshot();
+      state.tab = 'ig';
+      state.action = 'profile';
+      document.getElementById('queryInput').value = '';
+      document.getElementById('resultArea').innerHTML = renderWelcomeCards();
+      renderChrome(false);
+      updateNavBar();
+    }
+
+    function switchTab(tab, pushHist = true) {
+      if (pushHist && (tab !== state.tab)) pushHistorySnapshot();
+      state.tab = tab;
+      if (PLATFORM_CONFIG[tab]) {
+        state.action = PLATFORM_CONFIG[tab].actions[0].id;
+      }
+      renderChrome(true);
+      updateNavBar();
+      if (tab === 'docs') renderApiDocs();
+      if (tab === 'admin') initAdminTab();
+    }
+
+    function selectAction(actId) {
+      state.action = actId;
+      renderChrome(false);
+      document.getElementById('queryInput').focus();
+      updateNavBar();
+    }
+
+    function updateNavBar() {
+      document.getElementById('backBtn').disabled = state.history.length === 0;
+      const crumb = document.getElementById('crumbLabel');
+      if (state.tab === 'docs') {
+        crumb.textContent = '📖 Developer REST API Documentation';
+      } else if (state.tab === 'admin') {
+        crumb.textContent = '👑 Admin Panel (/tmp Zero-DB Store)';
+      } else {
+        const cfg = PLATFORM_CONFIG[state.tab];
+        const act = cfg.actions.find(a => a.id === state.action) || cfg.actions[0];
+        crumb.textContent = `${cfg.title.split(' ')[0]} ${state.tab.toUpperCase()} ➜ ${act.label}`;
+      }
+    }
+
+    function renderChrome(clearResult) {
+      document.body.setAttribute('data-theme', state.tab);
+      document.querySelectorAll('.nav-tab').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === state.tab);
+      });
+
+      const dlSec = document.getElementById('downloaderSection');
+      const docsSec = document.getElementById('docsSection');
+      const admSec = document.getElementById('adminSection');
+
+      dlSec.classList.toggle('hidden', !PLATFORM_CONFIG[state.tab]);
+      docsSec.classList.toggle('hidden', state.tab !== 'docs');
+      admSec.classList.toggle('hidden', state.tab !== 'admin');
+
+      if (!PLATFORM_CONFIG[state.tab]) return;
+
+      const cfg = PLATFORM_CONFIG[state.tab];
+      const actObj = cfg.actions.find(a => a.id === state.action) || cfg.actions[0];
+      document.getElementById('heroTitle').textContent = cfg.title;
+      document.getElementById('heroSub').textContent = cfg.sub;
+      document.getElementById('queryInput').placeholder = actObj.placeholder;
+
+      document.getElementById('actionPills').innerHTML = cfg.actions.map(a => `
+        <button type="button" class="action-pill ${a.id === state.action ? 'active' : ''}" onclick="selectAction('${a.id}')">
+          ${esc(a.label)}
+        </button>
+      `).join('');
+
+      document.getElementById('quickChips').innerHTML = `<span>Try example:</span>` + cfg.chips.map(c => `
+        <button type="button" class="chip" onclick="quickRun('${esc(c)}')">${esc(c)}</button>
+      `).join('');
+
+      if (clearResult) {
+        document.getElementById('resultArea').innerHTML = renderWelcomeCards();
+      }
+    }
+
+    function renderWelcomeCards() {
+      return `
+        <div class="guide-heading" id="services-guide"><span class="eyebrow">EXPLORE THE PORTAL</span><h2>Everything, in one place.</h2><p>Pick a platform to explore its available tools.</p></div>
+        <div class="picker-grid">
+          <div class="picker-item" onclick="switchTab('ig')">
+            <div style="font-size:22px;">📸</div>
+            <div style="font-weight:700;">Instagram Suite</div>
+            <div style="font-size:12.5px;color:var(--text-muted);">Profile pictures, stories, highlights, posts and reels.</div>
+          </div>
+          <div class="picker-item" onclick="switchTab('snap')">
+            <div style="font-size:22px;">👻</div>
+            <div style="font-weight:700;">Snapchat Dual DP &amp; Stories</div>
+            <div style="font-size:12.5px;color:var(--text-muted);">Profile and avatar tools, stories, highlights and spotlights.</div>
+          </div>
+          <div class="picker-item" onclick="switchTab('tg')">
+            <div style="font-size:22px;">✈️</div>
+            <div style="font-weight:700;">Telegram Channels &amp; Stories</div>
+            <div style="font-size:12.5px;color:var(--text-muted);">Public profiles, channel posts and connected Telegram stories.</div>
+          </div>
+          <div class="picker-item" onclick="switchTab('docs')">
+            <div style="font-size:22px;">📖</div>
+            <div style="font-weight:700;">Public REST API v1</div>
+            <div style="font-size:12.5px;color:var(--text-muted);">Ready-to-use JSON endpoints with live playground, cURL/JS/Python snippets &amp; CORS media proxy.</div>
+          </div>
+        </div>
+      `;
+    }
+
+    function quickRun(val) {
+      document.getElementById('queryInput').value = val;
+      executeCurrentSearch();
+    }
+
+    function handleSearchSubmit(e) {
+      e.preventDefault();
+      executeCurrentSearch();
+    }
+
+    function setLoading(msg = 'Fetching HD media...') {
+      document.getElementById('resultArea').innerHTML = `
+        <div class="result-box loader-wrap">
+          <div class="spinner"></div>
+          <div style="font-weight:700;color:var(--text);">${esc(msg)}</div>
+          <div style="font-size:12.5px;margin-top:4px;">Connecting to upstream CDN in Full HD...</div>
+        </div>
+      `;
+    }
+
+    function showError(err) {
+      const sugs = (err.suggestions || []).map(s =>
+        `<button class="chip" onclick="quickRun('${esc(s)}')">@${esc(s)}</button>`
+      ).join(' ');
+      document.getElementById('resultArea').innerHTML = `
+        <div class="err-card">
+          <div style="font-weight:800;font-size:16px;margin-bottom:6px;">⚠️ ${esc(err.message || err)}</div>
+          ${sugs ? `<div style="margin-top:10px;font-size:13px;">Similar accounts: ${sugs}</div>` : ''}
+          <div style="display:flex;gap:8px;margin-top:14px;">
+            <button class="btn-ghost" onclick="goBack()">⬅️ Back</button>
+            <button class="btn-ghost" onclick="goHome()">🏠 Main Menu</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function resultNavFooter() {
+      return `
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-top:20px;padding-top:16px;border-top:1px solid var(--border);">
+          <div style="display:flex;gap:8px;">
+            <button class="btn-ghost" onclick="goBack()">⬅️ Back</button>
+            <button class="btn-ghost" onclick="goHome()">🏠 Main Menu</button>
+          </div>
+          <span style="font-size:12px;color:var(--text-muted);">⚡ Powered by SocialGrab HD API</span>
+        </div>
+      `;
+    }
+
+    function openLightbox(src) {
+      document.getElementById('lightboxImg').src = src;
+      document.getElementById('lightboxModal').classList.add('open');
+    }
+
+    function closeModals() {
+      document.querySelectorAll('.modal-backdrop').forEach(m => m.classList.remove('open'));
+    }
+
+    // =====================================================================
+    // CORE SEARCH & MEDIA RENDERERS (100% PARITY WITH BOT!)
+    // =====================================================================
+
+    async function executeCurrentSearch() {
+      const raw = document.getElementById('queryInput').value.trim();
+      if (!raw) return;
+
+      // Auto-switch platform if user pasted a clear cross-platform URL!
+      const low = raw.toLowerCase();
+      if ((low.includes('snapchat.com/') || low.includes('t.snapchat.com/')) && state.tab !== 'snap') {
+        state.tab = 'snap';
+        state.action = low.includes('/spotlight/') ? 'spotlight' : 'profile';
+        renderChrome(false);
+      } else if ((low.includes('t.me/') || low.includes('telegram.me/')) && state.tab !== 'tg') {
+        state.tab = 'tg';
+        state.action = /t\.me\/[a-z0-9_]+\/\d+/i.test(low) ? 'post' : (low.includes('/s/') ? 'stories' : 'profile');
+        renderChrome(false);
+      } else if (low.includes('instagram.com/') && state.tab !== 'ig') {
+        state.tab = 'ig';
+        state.action = (low.includes('/p/') || low.includes('/reel/')) ? 'post' : (low.includes('/stories/') ? 'stories' : 'profile');
+        renderChrome(false);
+      }
+
+      pushHistorySnapshot();
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = true;
+
+      try {
+        if (state.tab === 'ig') await runInstagram(raw);
+        else if (state.tab === 'snap') await runSnapchat(raw);
+        else if (state.tab === 'tg') await runTelegram(raw);
+      } catch (err) {
+        showError(err);
+      } finally {
+        btn.disabled = false;
+        updateNavBar();
+      }
+    }
+
+    function renderMediaGridHtml(items, headerHtml) {
+      if (!items || !items.length) {
+        return `<div class="result-box">${headerHtml}<p style="color:var(--text-muted);margin-top:12px;">ℹ️ No active public media items found right now.</p>${resultNavFooter()}</div>`;
+      }
+      const cards = items.map((it, i) => `
+        <div class="media-card">
+          ${it.is_video
+            ? `<video src="${esc(it.view_url)}" controls playsinline preload="metadata"></video>`
+            : `<img src="${esc(it.view_url)}" alt="Slide ${i + 1}" loading="lazy" onclick="openLightbox('${esc(it.view_url)}')" />`
+          }
+          <div class="media-card-foot">
+            <span style="font-size:12px;color:var(--text-muted);font-weight:600;">#${i + 1} • ${it.is_video ? '🎬 HD Video' : '🖼️ HD Photo'}</span>
+            <a href="${esc(it.download_url)}" class="btn-primary" style="padding:7px 13px;font-size:12.5px;border-radius:9px;" download>📥 Download</a>
+          </div>
+        </div>
+      `).join('');
+      return `<div class="result-box">${headerHtml}<div class="media-grid">${cards}</div>${resultNavFooter()}</div>`;
+    }
+
+    // ---------------- INSTAGRAM ----------------
+    async function runInstagram(q, overrideAct = null) {
+      const act = overrideAct || state.action;
+      const low = q.toLowerCase();
+
+      if (low.includes('/p/') || low.includes('/reel/') || low.includes('/reels/') || low.includes('/tv/')) {
+        return await loadIgSinglePost(q);
+      }
+
+      if (act === 'profile') {
+        setLoading('Fetching Instagram Profile & 1080p HD DP...');
+        const d = await apiFetch(`/api/v1/instagram/profile?username=${encodeURIComponent(q)}`);
+        document.getElementById('resultArea').innerHTML = `
+          <div class="result-box">
+            <div class="profile-layout">
+              <div class="dp-card">
+                <img src="${esc(d.hd_profile_pic_view)}" alt="@${esc(d.username)}" onclick="openLightbox('${esc(d.hd_profile_pic_view)}')" />
+                <div class="dp-label">1080p Full HD (${esc(d.size_kb)} KB)</div>
+                <a href="${esc(d.hd_profile_pic_download)}" class="btn-primary" style="width:100%;padding:11px;" download>📥 Download HD DP</a>
+              </div>
+              <div>
+                <h2 style="font-size:22px;font-weight:800;">${esc(d.full_name || d.username)} <span style="color:var(--text-muted);font-weight:500;font-size:16px;">@${esc(d.username)}</span></h2>
+                <div class="badge-row">
+                  ${d.is_verified ? '<span class="tag verified">☑️ Verified</span>' : ''}
+                  <span class="tag ${d.is_private ? 'priv' : 'pub'}">${d.is_private ? '🔒 Private Account' : '🌐 Public Account'}</span>
+                  ${d.category ? `<span class="tag">🏷️ ${esc(d.category)}</span>` : ''}
+                  ${d.has_active_story ? '<span class="tag pub">⭕ Active Story!</span>' : ''}
+                </div>
+                <div class="stats-row">
+                  <div class="stat-tile"><div class="stat-val">${fmtNum(d.posts_count)}</div><div class="stat-lbl">Posts</div></div>
+                  <div class="stat-tile"><div class="stat-val">${fmtNum(d.followers_count)}</div><div class="stat-lbl">Followers</div></div>
+                  <div class="stat-tile"><div class="stat-val">${fmtNum(d.following_count)}</div><div class="stat-lbl">Following</div></div>
+                </div>
+                ${d.biography ? `<div class="bio-box">${esc(d.biography)}</div>` : ''}
+                ${d.external_url ? `<div style="font-size:13px;margin-top:6px;">🔗 <a href="${esc(d.external_url)}" target="_blank" rel="noopener" style="color:#38bdf8;">${esc(d.external_url)}</a></div>` : ''}
+                <div class="quick-actions-grid">
+                  <button class="btn-ghost" onclick="subActionIg('${esc(d.username)}','stories')">⭕ Stories</button>
+                  <button class="btn-ghost" onclick="subActionIg('${esc(d.username)}','highlights')">✨ Highlights</button>
+                  <button class="btn-ghost" onclick="subActionIg('${esc(d.username)}','post')">📸 Latest Posts</button>
+                  <button class="btn-ghost" onclick="subActionIg('${esc(d.username)}','reels')">🎬 Latest Reels</button>
+                </div>
+              </div>
+            </div>
+            ${resultNavFooter()}
+          </div>
+        `;
+        return;
+      }
+
+      if (act === 'stories') {
+        setLoading(`Checking @${q} active 24h Instagram Stories...`);
+        const d = await apiFetch(`/api/v1/instagram/stories?username=${encodeURIComponent(q)}`);
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(
+          d.items,
+          `<h2>⭕ @${esc(d.username)} — Active Instagram Stories (${d.count})</h2>`
+        );
+        return;
+      }
+
+      if (act === 'highlights') {
+        setLoading(`Loading @${q} Instagram Story Highlights...`);
+        const d = await apiFetch(`/api/v1/instagram/highlights?username=${encodeURIComponent(q)}`);
+        if (!d.highlights.length) {
+          document.getElementById('resultArea').innerHTML = `<div class="result-box"><h3>✨ @${esc(d.username)} Highlights</h3><p style="color:var(--text-muted);margin-top:10px;">No public Story Highlights found.</p>${resultNavFooter()}</div>`;
+          return;
         }
-    except Exception as exc:
-        _log_req(request, "ig", "Profile + HD DP", username, f"⚠️ {exc}")
-        raise
+        const cards = d.highlights.map(h => `
+          <div class="picker-item" onclick="loadIgHighlightSlides('${esc(d.username)}','${esc(h.highlight_id)}','${esc(h.title)}')">
+            <div style="font-size:22px;">✨</div>
+            <div style="font-weight:700;">${esc(h.title)}</div>
+            <div style="font-size:12px;color:var(--accent);">Tap to view &amp; download slides ➜</div>
+          </div>
+        `).join('');
+        document.getElementById('resultArea').innerHTML = `
+          <div class="result-box">
+            <h2>✨ @${esc(d.username)} — Story Highlights (${d.count})</h2>
+            <div class="picker-grid">${cards}</div>
+            ${resultNavFooter()}
+          </div>
+        `;
+        return;
+      }
 
-
-@app.get("/api/v1/instagram/stories", include_in_schema=False)
-async def api_ig_stories(
-    request: Request,
-    username: str = Query(..., description="Instagram username or story URL"),
-) -> Dict[str, Any]:
-    kind, val1, val2 = classify_instagram_input(username)
-    clean_u = val1 if kind in ("profile", "story") else username.strip().lstrip("@").lower()
-    sid = val2 if kind == "story" else None
-    items = await asyncio.to_thread(ig_service.get_user_stories, clean_u, sid)
-    serialized = [_serialize_media_item(m, f"{clean_u}_ig_story", i) for i, m in enumerate(items, 1)]
-    _log_req(request, "ig", "Active Stories", f"@{clean_u}", f"✅ {len(serialized)} stories")
-    return {
-        "ok": True,
-        "platform": "instagram",
-        "username": clean_u,
-        "count": len(serialized),
-        "items": serialized,
+      // Browse recent posts or reels by username
+      const isReels = act === 'reels';
+      setLoading(`Loading @${q} latest Instagram ${isReels ? 'Reels' : 'Posts'}...`);
+      const ep = isReels ? 'reels' : 'posts';
+      const d = await apiFetch(`/api/v1/instagram/${ep}?username=${encodeURIComponent(q)}`);
+      const list = d.reels || d.posts || [];
+      if (!list.length) {
+        document.getElementById('resultArea').innerHTML = `<div class="result-box"><h3>@${esc(d.username)}</h3><p style="color:var(--text-muted);margin-top:8px;">No public ${ep} found.</p>${resultNavFooter()}</div>`;
+        return;
+      }
+      const cards = list.map((p, idx) => `
+        <div class="picker-item" onclick="loadIgSinglePost('${esc(p.shortcode)}')">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:19px;">${p.is_carousel ? '📚 Carousel' : (p.is_video || isReels ? '🎬 Reel' : '🖼️ Photo')}</span>
+            <span style="font-size:12px;color:var(--text-muted);">${p.view_count ? '▶️ ' + fmtNum(p.view_count) : (p.like_count ? '❤️ ' + fmtNum(p.like_count) : '#' + (idx + 1))}</span>
+          </div>
+          <div style="font-size:13px;color:#425e79;">${esc((p.caption || 'No caption').slice(0, 70))}</div>
+          <div style="font-size:12px;color:var(--accent);font-weight:700;">Download HD ➜</div>
+        </div>
+      `).join('');
+      document.getElementById('resultArea').innerHTML = `
+        <div class="result-box">
+          <h2>${isReels ? '🎬' : '📸'} @${esc(d.username)} — Latest ${isReels ? 'Reels' : 'Posts'}</h2>
+          <div class="picker-grid">${cards}</div>
+          ${resultNavFooter()}
+        </div>
+      `;
     }
 
-
-@app.get("/api/v1/instagram/highlights", include_in_schema=False)
-async def api_ig_highlights(
-    request: Request,
-    username: str = Query(..., description="Instagram username"),
-) -> Dict[str, Any]:
-    _, clean_u, _ = classify_instagram_input(username)
-    trays = await asyncio.to_thread(ig_service.get_user_highlights, clean_u)
-    _log_req(request, "ig", "Highlights List", f"@{clean_u}", f"✅ {len(trays)} highlights")
-    return {
-        "ok": True,
-        "platform": "instagram",
-        "username": clean_u,
-        "count": len(trays),
-        "highlights": [{"highlight_id": h.highlight_id, "title": h.title} for h in trays],
+    async function subActionIg(uname, act) {
+      pushHistorySnapshot();
+      state.action = act;
+      renderChrome(false);
+      document.getElementById('queryInput').value = uname;
+      try { await runInstagram(uname, act); } catch (e) { showError(e); }
     }
 
-
-@app.get("/api/v1/instagram/highlight-items", include_in_schema=False)
-async def api_ig_highlight_items(
-    request: Request,
-    username: str = Query(...),
-    highlight_id: str = Query(...),
-) -> Dict[str, Any]:
-    clean_u = username.strip().lstrip("@").lower()
-    items = await asyncio.to_thread(ig_service.get_highlight_items, clean_u, highlight_id)
-    serialized = [_serialize_media_item(m, f"{clean_u}_hl_{highlight_id}", i) for i, m in enumerate(items, 1)]
-    _log_req(request, "ig", "Highlight Media", f"@{clean_u} ({highlight_id})", f"✅ {len(serialized)} slides")
-    return {
-        "ok": True,
-        "platform": "instagram",
-        "username": clean_u,
-        "highlight_id": highlight_id,
-        "count": len(serialized),
-        "items": serialized,
+    async function loadIgHighlightSlides(uname, hid, title) {
+      pushHistorySnapshot();
+      setLoading(`Downloading Highlight "${title}" slides...`);
+      try {
+        const d = await apiFetch(`/api/v1/instagram/highlight-items?username=${encodeURIComponent(uname)}&highlight_id=${encodeURIComponent(hid)}`);
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(
+          d.items,
+          `<h2>✨ @${esc(uname)} — ${esc(title)} (${d.count} slides)</h2>`
+        );
+      } catch (e) { showError(e); }
     }
 
-
-@app.get("/api/v1/instagram/posts", include_in_schema=False)
-async def api_ig_recent_posts(
-    request: Request,
-    username: str = Query(...),
-    limit: int = Query(8, ge=1, le=20),
-) -> Dict[str, Any]:
-    _, clean_u, _ = classify_instagram_input(username)
-    posts = await asyncio.to_thread(ig_service.get_recent_posts, clean_u, limit)
-    _log_req(request, "ig", "Recent Posts", f"@{clean_u}", f"✅ {len(posts)} posts")
-    return {
-        "ok": True,
-        "platform": "instagram",
-        "username": clean_u,
-        "count": len(posts),
-        "posts": [
-            {
-                "shortcode": p.shortcode,
-                "url": f"https://www.instagram.com/p/{p.shortcode}/",
-                "is_video": p.is_video,
-                "is_carousel": p.is_carousel,
-                "caption": p.caption,
-                "like_count": p.like_count,
-                "view_count": p.view_count,
-                "taken_at": p.taken_at,
-            }
-            for p in posts
-        ],
+    async function loadIgSinglePost(urlOrCode) {
+      pushHistorySnapshot();
+      setLoading('Downloading Instagram Post / Carousel / HD Reel...');
+      try {
+        const d = await apiFetch(`/api/v1/instagram/post?url=${encodeURIComponent(urlOrCode)}`);
+        const head = `
+          <div>
+            <h2>${d.count > 1 ? `📚 Carousel (${d.count} Slides)` : (d.items[0]?.is_video ? '🎬 HD Reel / Video' : '📸 HD Photo Post')}</h2>
+            <p style="color:var(--text-muted);font-size:13.5px;margin-top:4px;">
+              ${d.owner_username ? `👤 <b>@${esc(d.owner_username)}</b> • ` : ''}
+              ${d.like_count !== null ? `❤️ ${fmtNum(d.like_count)} ` : ''}
+              ${d.view_count ? `• ▶️ ${fmtNum(d.view_count)} views` : ''}
+            </p>
+            ${d.caption ? `<div class="bio-box">${esc(d.caption.slice(0, 380))}</div>` : ''}
+          </div>
+        `;
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(d.items, head);
+      } catch (e) { showError(e); }
     }
 
+    // ---------------- SNAPCHAT (DUAL FRONT + BACKGROUND DP!) ----------------
+    async function runSnapchat(q, overrideAct = null) {
+      const act = overrideAct || state.action;
+      if (q.toLowerCase().includes('/spotlight/') || q.toLowerCase().includes('t.snapchat.com/') || act === 'spotlight') {
+        setLoading('Downloading Snapchat Spotlight HD MP4...');
+        const d = await apiFetch(`/api/v1/snapchat/spotlight?q=${encodeURIComponent(q)}`);
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(
+          d.items,
+          `<h2>🔥 ${esc(d.title || 'Snapchat Spotlight')} (${d.count})</h2>`
+        );
+        return;
+      }
 
-@app.get("/api/v1/instagram/reels", include_in_schema=False)
-async def api_ig_recent_reels(
-    request: Request,
-    username: str = Query(...),
-    limit: int = Query(8, ge=1, le=20),
-) -> Dict[str, Any]:
-    _, clean_u, _ = classify_instagram_input(username)
-    reels = await asyncio.to_thread(ig_service.get_recent_reels, clean_u, limit)
-    _log_req(request, "ig", "Recent Reels", f"@{clean_u}", f"✅ {len(reels)} reels")
-    return {
-        "ok": True,
-        "platform": "instagram",
-        "username": clean_u,
-        "count": len(reels),
-        "reels": [
-            {
-                "shortcode": r.shortcode,
-                "url": f"https://www.instagram.com/reel/{r.shortcode}/",
-                "caption": r.caption,
-                "like_count": r.like_count,
-                "view_count": r.view_count,
-                "taken_at": r.taken_at,
-            }
-            for r in reels
-        ],
-    }
+      if (act === 'stories') {
+        setLoading(`Downloading @${q} active 24h Snapchat Stories...`);
+        const d = await apiFetch(`/api/v1/snapchat/stories?username=${encodeURIComponent(q)}`);
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(
+          d.items,
+          `<h2>👻 @${esc(d.username)} — Snapchat Stories (${d.count})</h2>`
+        );
+        return;
+      }
 
-
-@app.get("/api/v1/instagram/post", include_in_schema=False)
-async def api_ig_download_post(
-    request: Request,
-    url: str = Query(..., description="Instagram Post/Reel URL or shortcode"),
-) -> Dict[str, Any]:
-    kind, val1, _ = classify_instagram_input(url)
-    target = val1 if kind == "post" else url.strip()
-    post = await asyncio.to_thread(ig_service.download_post_or_reel, target)
-    serialized = [
-        _serialize_media_item(m, f"{post.owner_username or 'ig'}_{post.shortcode}", i)
-        for i, m in enumerate(post.items, 1)
-    ]
-    _log_req(request, "ig", "Post / Reel Download", target, f"✅ {len(serialized)} slide(s)")
-    return {
-        "ok": True,
-        "platform": "instagram",
-        "shortcode": post.shortcode,
-        "owner_username": post.owner_username,
-        "owner_full_name": post.owner_full_name,
-        "caption": post.caption,
-        "like_count": post.like_count,
-        "comment_count": post.comment_count,
-        "view_count": post.view_count,
-        "taken_at": post.taken_at,
-        "count": len(serialized),
-        "items": serialized,
-    }
-
-
-class IgLoginBody(BaseModel):
-    username: str = ""
-    password: str = ""
-    sessionid: str = ""
-
-
-class Ig2faBody(BaseModel):
-    code: str
-
-
-@app.post("/api/v1/instagram/login", include_in_schema=False)
-async def api_ig_login(body: IgLoginBody) -> Dict[str, Any]:
-    if body.sessionid.strip():
-        ig_service.set_session_id(body.sessionid.strip())
-        return {"ok": True, "status": "connected", "username": ig_service.logged_in_user}
-    if not body.username.strip() or not body.password:
-        raise HTTPException(status_code=400, detail="Provide username & password (or sessionid cookie).")
-    try:
-        u = await asyncio.to_thread(ig_service.login_with_password, body.username.strip(), body.password)
-        return {"ok": True, "status": "connected", "username": u}
-    except TwoFactorRequiredError as exc:
-        return {"ok": True, "status": "need_2fa", "message": str(exc)}
-
-
-@app.post("/api/v1/instagram/2fa", include_in_schema=False)
-async def api_ig_2fa(body: Ig2faBody) -> Dict[str, Any]:
-    u = await asyncio.to_thread(ig_service.complete_2fa_login, body.code.strip())
-    return {"ok": True, "status": "connected", "username": u}
-
-
-@app.post("/api/v1/instagram/logout", include_in_schema=False)
-async def api_ig_logout() -> Dict[str, Any]:
-    ig_service.logout()
-    return {"ok": True, "status": "logged_out"}
-
-
-# ===========================================================================
-# 2. SNAPCHAT REST API ENDPOINTS (Zero-Login + Dual Front & Background DP!)
-# ===========================================================================
-
-@app.get("/api/v1/snapchat/profile", include_in_schema=False)
-async def api_snap_profile(
-    request: Request,
-    username: str = Query(..., description="Snapchat username or profile URL"),
-) -> Dict[str, Any]:
-    kind, val = parse_snapchat_input(username)
-    if kind == "spotlight_url":
-        return await api_snap_spotlight(request, q=val)
-
-    prof = await asyncio.to_thread(snap_service.get_profile, val)
-    front_blob = _store_blob(prof.avatar_bytes)
-    fb_front = urllib.parse.quote(prof.avatar_url, safe="")
-    front_obj = {
-        "raw_url": prof.avatar_url,
-        "view_url": f"{front_blob}?filename={prof.username}_snap_front&fallback={fb_front}",
-        "download_url": f"{front_blob}?dl=1&filename={prof.username}_snap_front&fallback={fb_front}",
-        "size_kb": round(len(prof.avatar_bytes) / 1024.0, 1),
-    }
-
-    bg_obj = None
-    if prof.background_bytes and prof.background_url:
-        bg_blob = _store_blob(prof.background_bytes)
-        fb_bg = urllib.parse.quote(prof.background_url, safe="")
-        bg_obj = {
-            "raw_url": prof.background_url,
-            "view_url": f"{bg_blob}?filename={prof.username}_snap_background&fallback={fb_bg}",
-            "download_url": f"{bg_blob}?dl=1&filename={prof.username}_snap_background&fallback={fb_bg}",
-            "size_kb": round(len(prof.background_bytes) / 1024.0, 1),
+      if (act === 'highlights') {
+        setLoading(`Loading @${q} Snapchat Highlights...`);
+        const d = await apiFetch(`/api/v1/snapchat/highlights?username=${encodeURIComponent(q)}`);
+        if (!d.highlights.length) {
+          document.getElementById('resultArea').innerHTML = `<div class="result-box"><h3>✨ @${esc(d.username)} Snapchat Highlights</h3><p style="color:var(--text-muted);margin-top:8px;">No public Highlights found.</p>${resultNavFooter()}</div>`;
+          return;
         }
+        const cards = d.highlights.map(h => `
+          <div class="picker-item" onclick="loadSnapHighlightSnaps('${esc(d.username)}', ${h.index})">
+            <div style="font-size:20px;">✨</div>
+            <div style="font-weight:700;">${esc(h.title)}</div>
+            <div style="font-size:12px;color:var(--text-muted);">${h.count} snaps</div>
+            <div style="font-size:12px;color:var(--accent);font-weight:700;">View &amp; Download ➜</div>
+          </div>
+        `).join('');
+        document.getElementById('resultArea').innerHTML = `
+          <div class="result-box">
+            <h2>✨ @${esc(d.username)} — Snapchat Highlights (${d.count})</h2>
+            <div class="picker-grid">${cards}</div>
+            ${resultNavFooter()}
+          </div>
+        `;
+        return;
+      }
 
-    _log_req(
-        request,
-        "snap",
-        "Profile + Dual HD DP",
-        f"@{prof.username}",
-        "✅ Dual Front+BG DP" if bg_obj else "✅ Single DP",
-    )
-    return {
-        "ok": True,
-        "platform": "snapchat",
-        "username": prof.username,
-        "display_name": prof.display_name,
-        "bio": prof.bio,
-        "subscribers": prof.subscribers,
-        "is_verified": prof.is_verified,
-        "is_public_creator": prof.is_public_creator,
-        "has_bitmoji_3d": prof.has_bitmoji_3d,
-        "address": prof.address,
-        "website_url": prof.website_url,
-        "front_profile_pic": front_obj,
-        "background_profile_pic": bg_obj,
-        "snapcode_view_url": _proxy_url(prof.snapcode_url, f"{prof.username}_snapcode.png", dl=False),
-        "snapcode_download_url": _proxy_url(prof.snapcode_url, f"{prof.username}_snapcode.png", dl=True),
-        "stories_count": len(prof.stories),
-        "highlights_count": len(prof.highlights),
-        "spotlights_count": len(prof.spotlights),
-        "highlights_preview": [
-            {"index": h.index, "highlight_id": h.highlight_id, "title": h.title, "snaps_count": len(h.snaps)}
-            for h in prof.highlights
-        ],
+      if (act === 'snapcode') {
+        setLoading(`Generating 1000×1000 HD Snapcode for @${q}...`);
+        const d = await apiFetch(`/api/v1/snapchat/snapcode?username=${encodeURIComponent(q)}`);
+        document.getElementById('resultArea').innerHTML = `
+          <div class="result-box" style="text-align:center;">
+            <h2>🟨 @${esc(d.username)} — HD Snapcode (1000×1000 PNG)</h2>
+            <div style="max-width:280px;margin:18px auto;">
+              <img src="${esc(d.view_url)}" alt="Snapcode" style="width:100%;border-radius:18px;" />
+            </div>
+            <a href="${esc(d.download_url)}" class="btn-primary" download>📥 Download Snapcode PNG</a>
+            ${resultNavFooter()}
+          </div>
+        `;
+        return;
+      }
+
+      // Default: Snapchat Full Profile + Dual Front & Background HD Pics!
+      setLoading(`Fetching @${q} Snapchat Front + Background HD Profile Pics...`);
+      const d = await apiFetch(`/api/v1/snapchat/profile?username=${encodeURIComponent(q)}`);
+      if (d.items && !d.front_profile_pic) {
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(d.items, `<h2>🔥 ${esc(d.title || 'Snapchat')}</h2>`);
+        return;
+      }
+
+      const dualPicsHtml = `
+        <div class="snap-dual-grid">
+          <div class="dp-card">
+            <img src="${esc(d.front_profile_pic.view_url)}" alt="Front Profile Pic" onclick="openLightbox('${esc(d.front_profile_pic.view_url)}')" />
+            <div class="dp-label">👤 1. Front Profile Pic (${esc(d.front_profile_pic.size_kb)} KB)</div>
+            <a href="${esc(d.front_profile_pic.download_url)}" class="btn-primary" style="width:100%;padding:10px;" download>📥 Download Front HD</a>
+          </div>
+          ${d.background_profile_pic ? `
+            <div class="dp-card">
+              <img src="${esc(d.background_profile_pic.view_url)}" alt="Background Cover Pic" onclick="openLightbox('${esc(d.background_profile_pic.view_url)}')" />
+              <div class="dp-label">🏞️ 2. Background / Cover Pic (${esc(d.background_profile_pic.size_kb)} KB)</div>
+              <a href="${esc(d.background_profile_pic.download_url)}" class="btn-primary" style="width:100%;padding:10px;" download>📥 Download Background HD</a>
+            </div>
+          ` : `
+            <div class="dp-card">
+              <img src="${esc(d.snapcode_view_url)}" alt="Snapcode QR" onclick="openLightbox('${esc(d.snapcode_view_url)}')" />
+              <div class="dp-label">🟨 HD Snapcode QR (1000×1000)</div>
+              <a href="${esc(d.snapcode_download_url)}" class="btn-ghost" style="width:100%;justify-content:center;padding:10px;" download>📥 Download Snapcode</a>
+            </div>
+          `}
+        </div>
+      `;
+
+      document.getElementById('resultArea').innerHTML = `
+        <div class="result-box">
+          <div style="margin-bottom:16px;">
+            <h2 style="font-size:23px;font-weight:800;">👻 ${esc(d.display_name)} <span style="color:var(--text-muted);font-size:16px;">@${esc(d.username)}</span></h2>
+            <div class="badge-row">
+              ${d.is_verified ? '<span class="tag verified">⭐ Verified Snap Star</span>' : ''}
+              <span class="tag pub">${d.is_public_creator ? 'Public Creator Profile' : (d.has_bitmoji_3d ? '3D Bitmoji Profile' : 'Snapchat Account')}</span>
+              ${d.address ? `<span class="tag">📍 ${esc(d.address)}</span>` : ''}
+            </div>
+          </div>
+
+          ${dualPicsHtml}
+
+          <div class="stats-row">
+            <div class="stat-tile"><div class="stat-val">${d.subscribers ? fmtNum(d.subscribers) : '—'}</div><div class="stat-lbl">Subscribers</div></div>
+            <div class="stat-tile"><div class="stat-val">${d.stories_count}</div><div class="stat-lbl">Active 24h Stories</div></div>
+            <div class="stat-tile"><div class="stat-val">${d.highlights_count}</div><div class="stat-lbl">Highlights</div></div>
+            <div class="stat-tile"><div class="stat-val">${d.spotlights_count}</div><div class="stat-lbl">Spotlights</div></div>
+          </div>
+
+          ${d.bio ? `<div class="bio-box">${esc(d.bio)}</div>` : ''}
+
+          <div class="quick-actions-grid">
+            <button class="btn-ghost" onclick="subActionSnap('${esc(d.username)}','stories')">⭕ Stories (${d.stories_count})</button>
+            <button class="btn-ghost" onclick="subActionSnap('${esc(d.username)}','highlights')">✨ Highlights (${d.highlights_count})</button>
+            <button class="btn-ghost" onclick="subActionSnap('${esc(d.username)}','spotlight')">🔥 Spotlights (${d.spotlights_count})</button>
+            <button class="btn-ghost" onclick="subActionSnap('${esc(d.username)}','snapcode')">🟨 Snapcode QR</button>
+          </div>
+          ${resultNavFooter()}
+        </div>
+      `;
     }
 
-
-@app.get("/api/v1/snapchat/stories", include_in_schema=False)
-async def api_snap_stories(
-    request: Request,
-    username: str = Query(..., description="Snapchat username"),
-) -> Dict[str, Any]:
-    _, val = parse_snapchat_input(username)
-    prof = await asyncio.to_thread(snap_service.get_profile, val)
-    items = [_serialize_media_item(m, f"snap_{prof.username}_story", i) for i, m in enumerate(prof.stories, 1)]
-    _log_req(request, "snap", "Snap Stories", f"@{prof.username}", f"✅ {len(items)} snaps")
-    return {
-        "ok": True,
-        "platform": "snapchat",
-        "username": prof.username,
-        "count": len(items),
-        "items": items,
+    async function subActionSnap(uname, act) {
+      pushHistorySnapshot();
+      state.action = act;
+      renderChrome(false);
+      document.getElementById('queryInput').value = uname;
+      try { await runSnapchat(uname, act); } catch (e) { showError(e); }
     }
 
+    async function loadSnapHighlightSnaps(uname, idx) {
+      pushHistorySnapshot();
+      setLoading('Loading Snapchat Highlight snaps...');
+      try {
+        const d = await apiFetch(`/api/v1/snapchat/highlights?username=${encodeURIComponent(uname)}&index=${idx}`);
+        const hl = d.highlight;
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(
+          hl.items,
+          `<h2>✨ @${esc(uname)} — ${esc(hl.title)} (${hl.count} snaps)</h2>`
+        );
+      } catch (e) { showError(e); }
+    }
 
-@app.get("/api/v1/snapchat/highlights", include_in_schema=False)
-async def api_snap_highlights(
-    request: Request,
-    username: str = Query(..., description="Snapchat username"),
-    index: Optional[int] = Query(None, description="Optional specific highlight index to expand"),
-) -> Dict[str, Any]:
-    _, val = parse_snapchat_input(username)
-    prof = await asyncio.to_thread(snap_service.get_profile, val)
-    if index is not None:
-        if index < 0 or index >= len(prof.highlights):
-            raise HTTPException(status_code=404, detail="Highlight index out of range.")
-        hl = prof.highlights[index]
-        snaps = [_serialize_media_item(m, f"snap_{prof.username}_hl{index}", i) for i, m in enumerate(hl.snaps, 1)]
-        _log_req(request, "snap", f"Snap Highlight ({hl.title})", f"@{prof.username}", f"✅ {len(snaps)} snaps")
-        return {
-            "ok": True,
-            "platform": "snapchat",
-            "username": prof.username,
-            "highlight": {"index": hl.index, "title": hl.title, "count": len(snaps), "items": snaps},
+    // ---------------- TELEGRAM ----------------
+    async function runTelegram(q, overrideAct = null) {
+      const act = overrideAct || state.action;
+      if (act === 'stories' || act === 'highlights') {
+        const pinned = act === 'highlights';
+        setLoading(`Checking Telegram ${pinned ? 'Pinned Highlights' : 'Active Stories'}...`);
+        const d = await apiFetch(`/api/v1/telegram/stories?username=${encodeURIComponent(q)}&pinned=${pinned}`);
+        if (d.needs_mtproto) {
+          document.getElementById('resultArea').innerHTML = `
+            <div class="result-box">
+              <h3>✈️ @${esc(d.username)} — Telegram ${pinned ? 'Pinned Highlights' : 'Stories'}</h3>
+              <p style="color:var(--text-muted);margin:10px 0 16px;">${esc(d.error)}</p>
+              <button class="btn-primary" onclick="openTgModal()">🔑 Unlock Telegram Stories (1-Time MTProto Setup)</button>
+              ${resultNavFooter()}
+            </div>
+          `;
+          return;
         }
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(
+          d.items,
+          `<h2>✈️ @${esc(d.username)} — Telegram ${pinned ? 'Pinned Highlights' : 'Active Stories'} (${d.count})</h2>`
+        );
+        return;
+      }
 
-    _log_req(request, "snap", "Snap Highlights List", f"@{prof.username}", f"✅ {len(prof.highlights)} highlights")
-    return {
-        "ok": True,
-        "platform": "snapchat",
-        "username": prof.username,
-        "count": len(prof.highlights),
-        "highlights": [
-            {
-                "index": h.index,
-                "highlight_id": h.highlight_id,
-                "title": h.title,
-                "count": len(h.snaps),
-                "cover_url": _proxy_url(h.snaps[0].thumbnail_url or h.snaps[0].media_url, f"hl_{h.index}.jpg")
-                if h.snaps
-                else "",
-            }
-            for h in prof.highlights
-        ],
-    }
-
-
-@app.get("/api/v1/snapchat/spotlight", include_in_schema=False)
-async def api_snap_spotlight(
-    request: Request,
-    q: str = Query(..., description="Snapchat Spotlight URL or username"),
-) -> Dict[str, Any]:
-    kind, val = parse_snapchat_input(q)
-    if kind == "spotlight_url":
-        title, raw_items = await asyncio.to_thread(snap_service.download_share_or_spotlight_url, val)
-        items = [_serialize_media_item(m, "snap_spotlight", i) for i, m in enumerate(raw_items, 1)]
-        _log_req(request, "snap", "Spotlight Link", val, f"✅ {len(items)} video")
-        return {"ok": True, "platform": "snapchat", "title": title, "count": len(items), "items": items}
-
-    prof = await asyncio.to_thread(snap_service.get_profile, val)
-    items = [_serialize_media_item(m, f"snap_{prof.username}_spotlight", i) for i, m in enumerate(prof.spotlights, 1)]
-    _log_req(request, "snap", "Creator Spotlights", f"@{prof.username}", f"✅ {len(items)} videos")
-    return {
-        "ok": True,
-        "platform": "snapchat",
-        "username": prof.username,
-        "title": f"@{prof.username} Spotlights",
-        "count": len(items),
-        "items": items,
-    }
-
-
-@app.get("/api/v1/snapchat/snapcode", include_in_schema=False)
-async def api_snap_snapcode(
-    request: Request,
-    username: str = Query(..., description="Snapchat username"),
-) -> Dict[str, Any]:
-    _, uname = parse_snapchat_input(username)
-    qr_bytes = await asyncio.to_thread(snap_service.download_snapcode_bytes, uname)
-    blob = _store_blob(qr_bytes, "image/png")
-    raw_u = f"https://app.snapchat.com/web/deeplink/snapcode?username={uname}&type=PNG&size=1000"
-    fb = urllib.parse.quote(raw_u, safe="")
-    _log_req(request, "snap", "Snapcode QR", f"@{uname}", "✅ Sent 1000px QR")
-    return {
-        "ok": True,
-        "platform": "snapchat",
-        "username": uname,
-        "view_url": f"{blob}?filename={uname}_snapcode&fallback={fb}",
-        "download_url": f"{blob}?dl=1&filename={uname}_snapcode&fallback={fb}",
-        "raw_url": raw_u,
-    }
-
-
-# ===========================================================================
-# 3. TELEGRAM REST API ENDPOINTS (Public DP/Channels + Optional MTProto Story)
-# ===========================================================================
-
-@app.get("/api/v1/telegram/profile", include_in_schema=False)
-async def api_tg_profile(
-    request: Request,
-    username: str = Query(..., description="Telegram @username or t.me link"),
-) -> Dict[str, Any]:
-    kind, val1, val2 = classify_telegram_input(username)
-    if kind == "tg_post":
-        return await api_tg_post(request, url=f"https://t.me/{val1}/{val2}")
-
-    prof = await asyncio.to_thread(tg_service.get_public_profile, val1)
-    view_u = ""
-    dl_u = ""
-    if prof.avatar_bytes and prof.avatar_url:
-        blob = _store_blob(prof.avatar_bytes, "image/jpeg")
-        fb = urllib.parse.quote(prof.avatar_url, safe="")
-        view_u = f"{blob}?filename={prof.username}_tg_dp&fallback={fb}"
-        dl_u = f"{blob}?dl=1&filename={prof.username}_tg_dp&fallback={fb}"
-
-    _log_req(request, "tg", "Profile + HD DP", f"@{prof.username}", "✅ Success")
-    return {
-        "ok": True,
-        "platform": "telegram",
-        "username": prof.username,
-        "title": prof.title,
-        "bio": prof.bio,
-        "extra_stats": prof.extra_stats,
-        "is_verified": prof.is_verified,
-        "is_channel_or_group": prof.is_channel_or_group,
-        "avatar_raw": prof.avatar_url,
-        "avatar_view": view_u,
-        "avatar_download": dl_u,
-        "stories_mtproto_unlocked": tg_service.has_story_mtproto,
-    }
-
-
-@app.get("/api/v1/telegram/channel-posts", include_in_schema=False)
-async def api_tg_channel_posts(
-    request: Request,
-    channel: str = Query(..., description="Public Telegram channel username"),
-    limit: int = Query(8, ge=1, le=20),
-) -> Dict[str, Any]:
-    _, ch, _ = classify_telegram_input(channel)
-    posts = await asyncio.to_thread(tg_service.get_recent_channel_posts, ch, limit)
-    _log_req(request, "tg", "Channel Posts List", f"@{ch}", f"✅ {len(posts)} posts")
-    return {
-        "ok": True,
-        "platform": "telegram",
-        "channel": ch,
-        "count": len(posts),
-        "posts": [
-            {
-                "post_id": p["post_id"],
-                "icon": p["icon"],
-                "snippet": p["snippet"],
-                "url": f"https://t.me/{ch}/{p['post_id']}",
-            }
-            for p in posts
-        ],
-    }
-
-
-@app.get("/api/v1/telegram/post", include_in_schema=False)
-async def api_tg_post(
-    request: Request,
-    url: str = Query(..., description="Public Telegram post URL (https://t.me/channel/123)"),
-) -> Dict[str, Any]:
-    kind, ch, pid = classify_telegram_input(url)
-    if kind != "tg_post":
-        return await api_tg_channel_posts(request, channel=ch, limit=8)
-    post = await asyncio.to_thread(tg_service.download_channel_post, ch, pid)
-    items = [_serialize_media_item(m, f"tg_{ch}_{pid}", i) for i, m in enumerate(post.items, 1)]
-    _log_req(request, "tg", "Channel Post Media", f"{ch}/{pid}", f"✅ {len(items)} item(s)")
-    return {
-        "ok": True,
-        "platform": "telegram",
-        "channel": post.channel,
-        "post_id": post.post_id,
-        "caption": post.caption,
-        "views": post.views,
-        "count": len(items),
-        "items": items,
-    }
-
-
-@app.get("/api/v1/telegram/stories", include_in_schema=False)
-async def api_tg_stories(
-    request: Request,
-    username: str = Query(..., description="Telegram username or t.me/user/s/id link"),
-    pinned: bool = Query(False, description="True for Pinned Highlights, False for Active 24h Stories"),
-) -> Dict[str, Any]:
-    kind, uname, sid = classify_telegram_input(username)
-    if not tg_service.has_story_mtproto:
-        _log_req(request, "tg", "TG Stories", f"@{uname}", "ℹ️ MTProto Not Connected")
-        return {
-            "ok": False,
-            "needs_mtproto": True,
-            "username": uname,
-            "error": (
-                "Telegram Bot/Web API hides Stories without an MTProto client session. "
-                "Click 'Unlock TG Stories' to connect your free my.telegram.org API_ID & API_HASH!"
-            ),
+      if (act === 'post' || /t\.me\/[a-z0-9_]+\/\d+/i.test(q)) {
+        setLoading('Fetching Telegram Channel Media...');
+        const d = await apiFetch(`/api/v1/telegram/post?url=${encodeURIComponent(q)}`);
+        if (d.posts) {
+          // Returned list of recent channel posts
+          const cards = d.posts.map(p => `
+            <div class="picker-item" onclick="loadTgSinglePost('${esc(p.url)}')">
+              <div style="font-weight:700;">${esc(p.icon)} Post #${esc(p.post_id)}</div>
+              <div style="font-size:13px;color:var(--text-muted);">${esc(p.snippet || 'Media post')}</div>
+              <div style="font-size:12px;color:var(--accent);font-weight:700;">Download HD ➜</div>
+            </div>
+          `).join('');
+          document.getElementById('resultArea').innerHTML = `
+            <div class="result-box">
+              <h2>📢 @${esc(d.channel)} — Recent Media Posts</h2>
+              <div class="picker-grid">${cards || '<p style="color:var(--text-muted);">No public media posts found.</p>'}</div>
+              ${resultNavFooter()}
+            </div>
+          `;
+          return;
         }
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(
+          d.items,
+          `<div><h2>✈️ @${esc(d.channel)} — Post #${esc(d.post_id)}</h2>${d.views ? `<p style="color:var(--text-muted);font-size:13px;">👁 ${esc(d.views)} views</p>` : ''}${d.caption ? `<div class="bio-box">${esc(d.caption)}</div>` : ''}</div>`
+        );
+        return;
+      }
 
-    story_id_int = int(sid) if (kind == "tg_story" and sid.isdigit()) else None
-    dl_list = await tg_service.fetch_stories_mtproto(uname, story_id=story_id_int, pinned=pinned, limit=10)
-    out = []
-    for idx, st in enumerate(dl_list, 1):
-        mime = "video/mp4" if st.is_video else "image/jpeg"
-        blob = _store_blob(st.data, mime)
-        out.append(
-            {
-                "index": idx,
-                "story_id": st.story_id,
-                "is_video": st.is_video,
-                "caption": st.caption,
-                "view_url": f"{blob}?filename=tg_{uname}_story_{st.story_id}",
-                "download_url": f"{blob}?dl=1&filename=tg_{uname}_story_{st.story_id}",
-            }
-        )
-    _log_req(request, "tg", "Pinned Highlights" if pinned else "Active Stories", f"@{uname}", f"✅ {len(out)} stories")
-    return {
-        "ok": True,
-        "platform": "telegram",
-        "username": uname,
-        "pinned": pinned,
-        "count": len(out),
-        "items": out,
+      setLoading(`Fetching @${q} Telegram Profile / Channel Info...`);
+      const d = await apiFetch(`/api/v1/telegram/profile?username=${encodeURIComponent(q)}`);
+      if (d.items) {
+        document.getElementById('resultArea').innerHTML = renderMediaGridHtml(d.items, `<h2>✈️ @${esc(d.channel)} #${esc(d.post_id)}</h2>`);
+        return;
+      }
+      document.getElementById('resultArea').innerHTML = `
+        <div class="result-box">
+          <div class="profile-layout">
+            <div class="dp-card">
+              ${d.avatar_view
+                ? `<img src="${esc(d.avatar_view)}" alt="@${esc(d.username)}" onclick="openLightbox('${esc(d.avatar_view)}')" />
+                   <div class="dp-label">HD Telegram Avatar</div>
+                   <a href="${esc(d.avatar_download)}" class="btn-primary" style="width:100%;padding:11px;" download>📥 Download HD DP</a>`
+                : `<div style="padding:45px 10px;color:var(--text-muted);">No Public DP</div>`
+              }
+            </div>
+            <div>
+              <h2 style="font-size:22px;font-weight:800;">✈️ ${esc(d.title)} <span style="color:var(--text-muted);font-size:16px;">@${esc(d.username)}</span></h2>
+              <div class="badge-row">
+                ${d.is_verified ? '<span class="tag verified">☑️ Verified</span>' : ''}
+                <span class="tag pub">${d.is_channel_or_group ? '📢 Channel / Group' : '👤 Telegram User'}</span>
+                ${d.extra_stats ? `<span class="tag">👥 ${esc(d.extra_stats)}</span>` : ''}
+              </div>
+              ${d.bio ? `<div class="bio-box">${esc(d.bio)}</div>` : ''}
+              <div class="quick-actions-grid">
+                ${d.is_channel_or_group ? `<button class="btn-ghost" onclick="subActionTg('${esc(d.username)}','post')">📢 Latest Channel Media</button>` : ''}
+                <button class="btn-ghost" onclick="subActionTg('${esc(d.username)}','stories')">⭕ Active Stories</button>
+                <button class="btn-ghost" onclick="subActionTg('${esc(d.username)}','highlights')">📌 Pinned Highlights</button>
+                <a href="https://t.me/${esc(d.username)}" target="_blank" rel="noopener" class="btn-ghost">🔗 Open in Telegram</a>
+              </div>
+            </div>
+          </div>
+          ${resultNavFooter()}
+        </div>
+      `;
     }
 
-
-class TgMtStartBody(BaseModel):
-    api_id: int
-    api_hash: str
-    phone: str
-
-
-class TgMtOtpBody(BaseModel):
-    code: str
-
-
-class TgMt2faBody(BaseModel):
-    password: str
-
-
-@app.post("/api/v1/telegram/mtproto/start", include_in_schema=False)
-async def api_tg_mtproto_start(body: TgMtStartBody) -> Dict[str, Any]:
-    await tg_service.start_mtproto_login(body.api_id, body.api_hash.strip(), body.phone.strip())
-    return {"ok": True, "status": "otp_sent"}
-
-
-@app.post("/api/v1/telegram/mtproto/verify-otp", include_in_schema=False)
-async def api_tg_mtproto_otp(body: TgMtOtpBody) -> Dict[str, Any]:
-    status_res, label = await tg_service.verify_mtproto_otp(body.code)
-    return {"ok": True, "status": status_res, "account": label}
-
-
-@app.post("/api/v1/telegram/mtproto/verify-2fa", include_in_schema=False)
-async def api_tg_mtproto_2fa(body: TgMt2faBody) -> Dict[str, Any]:
-    label = await tg_service.verify_mtproto_2fa(body.password)
-    return {"ok": True, "status": "connected", "account": label}
-
-
-# ===========================================================================
-# Universal Auto-Resolve Endpoint (`/api/v1/resolve`)
-# ===========================================================================
-
-@app.get("/api/v1/resolve", include_in_schema=False)
-async def api_universal_resolve(
-    request: Request,
-    q: str = Query(..., description="Any Instagram, Snapchat, or Telegram URL or username"),
-    platform: str = Query("auto", description="auto | ig | snap | tg"),
-) -> Dict[str, Any]:
-    low = q.strip().lower()
-    plat = platform.lower().strip()
-    if plat == "auto":
-        if "snapchat.com/" in low or "t.snapchat.com/" in low:
-            plat = "snap"
-        elif "t.me/" in low or "telegram.me/" in low:
-            plat = "tg"
-        else:
-            plat = "ig"
-
-    if plat == "snap":
-        kind, val = parse_snapchat_input(q)
-        if kind == "spotlight_url":
-            return await api_snap_spotlight(request, q=val)
-        return await api_snap_profile(request, username=val)
-
-    if plat == "tg":
-        kind, v1, v2 = classify_telegram_input(q)
-        if kind == "tg_post":
-            return await api_tg_post(request, url=f"https://t.me/{v1}/{v2}")
-        if kind == "tg_story":
-            return await api_tg_stories(request, username=q, pinned=False)
-        return await api_tg_profile(request, username=v1)
-
-    kind, v1, _ = classify_instagram_input(q)
-    if kind == "post":
-        return await api_ig_download_post(request, url=v1)
-    if kind == "story":
-        return await api_ig_stories(request, username=q)
-    return await api_ig_profile(request, username=v1)
-
-
-# ===========================================================================
-# 4. ADMIN PANEL API (Zero-DB `/tmp` Temp File + Export `.txt`)
-# ===========================================================================
-
-def _require_admin(request: Request, key: str = "") -> None:
-    candidate = key or request.headers.get("x-admin-key", "")
-    if not web_store.verify_key(candidate):
-        raise HTTPException(status_code=401, detail="Invalid Admin Key. Enter your Admin ID / Key.")
-
-
-@app.get("/api/v1/admin/summary", include_in_schema=False)
-async def api_admin_summary(request: Request, key: str = Query("")) -> Dict[str, Any]:
-    _require_admin(request, key)
-    data = web_store.summary_dict()
-    data["ok"] = True
-    data["ig_connected"] = ig_service.logged_in_user if ig_service.session_id else None
-    data["tg_mtproto_connected"] = tg_service.logged_in_label if tg_service.has_story_mtproto else None
-    return data
-
-
-@app.post("/api/v1/admin/toggle-alerts", include_in_schema=False)
-async def api_admin_toggle(request: Request, key: str = Query("")) -> Dict[str, Any]:
-    _require_admin(request, key)
-    enabled = web_store.toggle_alerts()
-    return {"ok": True, "live_tg_alerts": enabled}
-
-
-@app.post("/api/v1/admin/clear", include_in_schema=False)
-async def api_admin_clear(request: Request, key: str = Query("")) -> Dict[str, Any]:
-    _require_admin(request, key)
-    web_store.clear_all()
-    return {"ok": True}
-
-
-class AdminKeyBody(BaseModel):
-    custom_key: str = ""
-    label: str = ""
-
-
-class AdminKeyDeleteBody(BaseModel):
-    target_key: str
-
-
-@app.post("/api/v1/admin/keys/create", include_in_schema=False)
-async def api_admin_create_key(request: Request, body: AdminKeyBody, key: str = Query("")) -> Dict[str, Any]:
-    _require_admin(request, key)
-    created = web_store.create_api_key(body.custom_key, body.label)
-    return {"ok": True, "api_key": created, "api_keys": web_store.list_api_keys()}
-
-
-@app.post("/api/v1/admin/keys/delete", include_in_schema=False)
-async def api_admin_delete_key(request: Request, body: AdminKeyDeleteBody, key: str = Query("")) -> Dict[str, Any]:
-    _require_admin(request, key)
-    web_store.delete_api_key(body.target_key)
-    return {"ok": True, "api_keys": web_store.list_api_keys()}
-
-
-@app.post("/api/v1/admin/keys/toggle-mode", include_in_schema=False)
-async def api_admin_toggle_key_mode(request: Request, key: str = Query("")) -> Dict[str, Any]:
-    _require_admin(request, key)
-    mode = web_store.toggle_open_key_mode()
-    return {"ok": True, "open_key_mode": mode}
-
-
-@app.get("/api/v1/admin/export-txt", include_in_schema=False)
-async def api_admin_export_txt(
-    request: Request,
-    key: str = Query(""),
-    visitor_id: Optional[str] = Query(None),
-) -> Response:
-    _require_admin(request, key)
-    content = web_store.export_txt_report(visitor_id=visitor_id)
-    fname = f"visitor_{visitor_id}_report.tmp.txt" if visitor_id else "social_web_admin_report.tmp.txt"
-    return PlainTextResponse(
-        content=content,
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-    )
-
-
-# ===========================================================================
-# 5. CLEAN PATH-BASED PUBLIC API (`/{key}/{platform}/{action}/{query}` & Shorthands)
-#    Examples:
-#      /{key}/snap/pic/{query}         | /{key}/snappic/{query}
-#      /{key}/snap/info/{query}        | /{key}/snapinfo/{query}
-#      /{key}/snap/story/{query}       | /{key}/snapstory/{query}
-#      /{key}/snap/highlights/{query}  | /{key}/snaphighlights/{query}
-#      /{key}/snap/spotlight/{query}   | /{key}/snapspotlight/{query}
-#      /{key}/snap/snapcode/{query}    | /{key}/snapcode/{query}
-#      /{key}/insta/pic/{query}        | /{key}/instapic/{query}
-#      /{key}/insta/info/{query}       | /{key}/instainfo/{query}
-#      /{key}/insta/story/{query}      | /{key}/instastory/{query}
-#      /{key}/insta/highlights/{query} | /{key}/instahighlights/{query}
-#      /{key}/insta/post/{query}       | /{key}/instapost/{query}
-#      /{key}/insta/reel/{query}       | /{key}/instareel/{query}
-#      /{key}/tg/pic/{query}           | /{key}/tgpic/{query}
-#      /{key}/tg/info/{query}          | /{key}/tginfo/{query}
-#      /{key}/tg/story/{query}         | /{key}/tgstory/{query}
-#      /{key}/tg/highlights/{query}    | /{key}/tghighlights/{query}
-#      /{key}/tg/post/{query}          | /{key}/tgpost/{query}
-# ===========================================================================
-
-SHORTHAND_MAP: Dict[str, tuple[str, str]] = {
-    # Snapchat shorthands
-    "snappic": ("snap", "pic"),
-    "snapdp": ("snap", "pic"),
-    "snapinfo": ("snap", "info"),
-    "snapprofile": ("snap", "info"),
-    "snapstory": ("snap", "story"),
-    "snapstories": ("snap", "story"),
-    "snaphighlights": ("snap", "highlights"),
-    "snaphighlight": ("snap", "highlights"),
-    "snapspotlight": ("snap", "spotlight"),
-    "snapspotlights": ("snap", "spotlight"),
-    "snapcode": ("snap", "snapcode"),
-    # Instagram shorthands
-    "instapic": ("insta", "pic"),
-    "instadp": ("insta", "pic"),
-    "igpic": ("insta", "pic"),
-    "igdp": ("insta", "pic"),
-    "instainfo": ("insta", "info"),
-    "instaprofile": ("insta", "info"),
-    "iginfo": ("insta", "info"),
-    "instastory": ("insta", "story"),
-    "instastories": ("insta", "story"),
-    "igstory": ("insta", "story"),
-    "instahighlights": ("insta", "highlights"),
-    "instahighlight": ("insta", "highlights"),
-    "ighighlights": ("insta", "highlights"),
-    "instapost": ("insta", "post"),
-    "instaposts": ("insta", "post"),
-    "igpost": ("insta", "post"),
-    "instareel": ("insta", "reel"),
-    "instareels": ("insta", "reel"),
-    "igreel": ("insta", "reel"),
-    # Telegram shorthands
-    "tgpic": ("tg", "pic"),
-    "tgdp": ("tg", "pic"),
-    "tginfo": ("tg", "info"),
-    "tgprofile": ("tg", "info"),
-    "tgstory": ("tg", "story"),
-    "tgstories": ("tg", "story"),
-    "tghighlights": ("tg", "highlights"),
-    "tghighlight": ("tg", "highlights"),
-    "tgpost": ("tg", "post"),
-    "tgposts": ("tg", "post"),
-    "tgchannel": ("tg", "post"),
-}
-
-
-def _request_origin(request: Request) -> str:
-    if request.headers.get("x-ui-client") == "1":
-        return ""
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
-    host = (
-        request.headers.get("x-forwarded-host")
-        or request.headers.get("host")
-        or request.url.netloc
-    )
-    return f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}" if host else ""
-
-
-def _absolutize_urls(obj: Any, origin: str) -> Any:
-    if not origin:
-        return obj
-    if isinstance(obj, dict):
-        return {k: _absolutize_urls(v, origin) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_absolutize_urls(x, origin) for x in obj]
-    if isinstance(obj, str) and obj.startswith("/api/"):
-        return f"{origin}{obj}"
-    return obj
-
-
-def _clean_path_query(raw_q: str) -> str:
-    q = (raw_q or "").strip().strip("/")
-    # Fix collapsed scheme slashes when users paste full URLs inside URL paths (`https:/www.` -> `https://www.`)
-    q = re.sub(r"^(https?):/+", r"\1://", q, flags=re.I)
-    return q
-
-
-def _check_path_api_key(request: Request, key: str) -> str:
-    clean_k = (key or "").strip()
-    if not web_store.validate_api_key(clean_k):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API key in URL path. Use 'demo' or generate an API key in the Admin Panel.",
-        )
-    request.state.path_api_key = clean_k
-    return clean_k
-
-
-def _looks_like_ig_shortcode_or_url(q: str) -> bool:
-    low = q.lower()
-    if any(seg in low for seg in ("/p/", "/reel/", "/reels/", "/tv/")):
-        return True
-    if "/" not in q and "." not in q and not q.startswith("@"):
-        if "-" in q or any(c.isupper() for c in q):
-            return True
-    return False
-
-
-async def _dispatch_clean_api(
-    request: Request,
-    key: str,
-    platform: str,
-    action: str,
-    raw_query: str,
-) -> Any:
-    clean_key = _check_path_api_key(request, key)
-    origin = _request_origin(request)
-    q = _clean_path_query(raw_query)
-    if not q:
-        raise HTTPException(status_code=400, detail="Missing query parameter in URL path.")
-
-    plat = platform.lower().strip()
-    act = action.lower().strip()
-    direct_binary = request.query_params.get("direct") == "1" or request.query_params.get("raw") == "1"
-
-    # --------------------- SNAPCHAT ---------------------
-    if plat in ("snap", "snapchat"):
-        if act in ("pic", "dp", "avatar"):
-            _, val = parse_snapchat_input(q)
-            prof = await asyncio.to_thread(snap_service.get_profile, val)
-            if direct_binary and prof.avatar_bytes:
-                _log_req(request, "snap", "Snap Pic (Direct)", f"@{prof.username}", "✅ Binary HD")
-                mime = "image/png" if prof.avatar_bytes[:8].startswith(b"\x89PNG") else "image/jpeg"
-                return Response(content=prof.avatar_bytes, media_type=mime)
-
-            full = await api_snap_profile(request, username=val)
-            res = {
-                "ok": True,
-                "platform": "snapchat",
-                "endpoint": "pic",
-                "username": full["username"],
-                "display_name": full["display_name"],
-                "is_verified": full["is_verified"],
-                "front_profile_pic": full["front_profile_pic"],
-                "background_profile_pic": full["background_profile_pic"],
-                "snapcode_view_url": full["snapcode_view_url"],
-                "snapcode_download_url": full["snapcode_download_url"],
-            }
-            return _absolutize_urls(res, origin)
-
-        if act in ("info", "profile"):
-            res = await api_snap_profile(request, username=q)
-            res["endpoint"] = "info"
-            return _absolutize_urls(res, origin)
-
-        if act in ("story", "stories"):
-            res = await api_snap_stories(request, username=q)
-            res["endpoint"] = "story"
-            return _absolutize_urls(res, origin)
-
-        if act in ("highlights", "highlight"):
-            # Support both `/{key}/snap/highlights/{user}` AND `/{key}/snap/highlights/{user}/{index}`
-            parts = [p for p in q.split("/") if p]
-            if len(parts) == 2 and parts[1].isdigit() and "snapchat.com" not in q.lower():
-                res = await api_snap_highlights(request, username=parts[0], index=int(parts[1]))
-                return _absolutize_urls(res, origin)
-
-            _, val = parse_snapchat_input(q)
-            prof = await asyncio.to_thread(snap_service.get_profile, val)
-            all_hl = []
-            for h in prof.highlights:
-                snaps = [_serialize_media_item(m, f"snap_{prof.username}_hl{h.index}", i) for i, m in enumerate(h.snaps, 1)]
-                all_hl.append(
-                    {
-                        "index": h.index,
-                        "highlight_id": h.highlight_id,
-                        "title": h.title,
-                        "count": len(snaps),
-                        "single_highlight_api": f"{origin}/{clean_key}/snap/highlights/{prof.username}/{h.index}",
-                        "items": snaps,
-                    }
-                )
-            _log_req(request, "snap", "Snap Highlights", f"@{prof.username}", f"✅ {len(all_hl)} highlights")
-            return _absolutize_urls(
-                {
-                    "ok": True,
-                    "platform": "snapchat",
-                    "endpoint": "highlights",
-                    "username": prof.username,
-                    "count": len(all_hl),
-                    "highlights": all_hl,
-                },
-                origin,
-            )
-
-        if act in ("spotlight", "spotlights"):
-            res = await api_snap_spotlight(request, q=q)
-            res["endpoint"] = "spotlight"
-            return _absolutize_urls(res, origin)
-
-        if act in ("snapcode", "qr"):
-            res = await api_snap_snapcode(request, username=q)
-            res["endpoint"] = "snapcode"
-            return _absolutize_urls(res, origin)
-
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown Snapchat action '{act}'. Valid: pic, info, story, highlights, spotlight, snapcode.",
-        )
-
-    # --------------------- INSTAGRAM ---------------------
-    if plat in ("insta", "ig", "instagram"):
-        if act in ("pic", "dp", "avatar"):
-            _, clean_u, _ = classify_instagram_input(q)
-            prof_res = await asyncio.to_thread(ig_service.get_profile_pic, clean_u)
-            if direct_binary and prof_res.image_bytes:
-                _log_req(request, "ig", "IG Pic (Direct)", f"@{prof_res.username}", "✅ Binary HD")
-                return Response(content=prof_res.image_bytes, media_type="image/jpeg")
-
-            blob_path = _store_blob(prof_res.image_bytes, "image/jpeg")
-            fb_enc = urllib.parse.quote(prof_res.hd_pic_url, safe="")
-            _log_req(request, "ig", "IG HD Pic", f"@{prof_res.username}", "✅ 1080p HD")
-            return _absolutize_urls(
-                {
-                    "ok": True,
-                    "platform": "instagram",
-                    "endpoint": "pic",
-                    "username": prof_res.username,
-                    "full_name": prof_res.full_name,
-                    "is_private": prof_res.is_private,
-                    "is_verified": prof_res.is_verified,
-                    "raw_url": prof_res.hd_pic_url,
-                    "view_url": f"{blob_path}?filename={prof_res.username}_ig_hd&fallback={fb_enc}",
-                    "download_url": f"{blob_path}?dl=1&filename={prof_res.username}_ig_hd&fallback={fb_enc}",
-                    "size_kb": round(len(prof_res.image_bytes) / 1024.0, 1),
-                },
-                origin,
-            )
-
-        if act in ("info", "profile"):
-            res = await api_ig_profile(request, username=q)
-            res["endpoint"] = "info"
-            return _absolutize_urls(res, origin)
-
-        if act in ("story", "stories"):
-            res = await api_ig_stories(request, username=q)
-            res["endpoint"] = "story"
-            return _absolutize_urls(res, origin)
-
-        if act in ("highlights", "highlight"):
-            # Support `/{key}/insta/highlights/{username}` AND `/{key}/insta/highlights/{username}/{highlight_id}`
-            parts = [p for p in q.split("/") if p]
-            if len(parts) == 2 and "instagram.com" not in q.lower():
-                res = await api_ig_highlight_items(request, username=parts[0], highlight_id=parts[1])
-                res["endpoint"] = "highlight_items"
-                return _absolutize_urls(res, origin)
-
-            res = await api_ig_highlights(request, username=q)
-            res["endpoint"] = "highlights"
-            uname = res["username"]
-            for h in res.get("highlights", []):
-                h["slides_api_url"] = f"{origin}/{clean_key}/insta/highlights/{uname}/{h['highlight_id']}"
-            return _absolutize_urls(res, origin)
-
-        if act in ("post", "posts", "carousel"):
-            if _looks_like_ig_shortcode_or_url(q):
-                res = await api_ig_download_post(request, url=q)
-                res["endpoint"] = "post"
-                return _absolutize_urls(res, origin)
-            res = await api_ig_recent_posts(request, username=q, limit=8)
-            for p in res.get("posts", []):
-                p["download_api_url"] = f"{origin}/{clean_key}/insta/post/{p['shortcode']}"
-            res["endpoint"] = "posts"
-            return _absolutize_urls(res, origin)
-
-        if act in ("reel", "reels"):
-            if _looks_like_ig_shortcode_or_url(q):
-                res = await api_ig_download_post(request, url=q)
-                res["endpoint"] = "reel"
-                return _absolutize_urls(res, origin)
-            res = await api_ig_recent_reels(request, username=q, limit=8)
-            for r in res.get("reels", []):
-                r["download_api_url"] = f"{origin}/{clean_key}/insta/reel/{r['shortcode']}"
-            res["endpoint"] = "reels"
-            return _absolutize_urls(res, origin)
-
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown Instagram action '{act}'. Valid: pic, info, story, highlights, post, reel.",
-        )
-
-    # --------------------- TELEGRAM ---------------------
-    if plat in ("tg", "telegram"):
-        if act in ("pic", "dp", "avatar"):
-            _, val1, _ = classify_telegram_input(q)
-            prof = await asyncio.to_thread(tg_service.get_public_profile, val1)
-            if direct_binary and prof.avatar_bytes:
-                _log_req(request, "tg", "TG Pic (Direct)", f"@{prof.username}", "✅ Binary HD")
-                return Response(content=prof.avatar_bytes, media_type="image/jpeg")
-
-            view_u = ""
-            dl_u = ""
-            if prof.avatar_bytes and prof.avatar_url:
-                blob = _store_blob(prof.avatar_bytes, "image/jpeg")
-                fb = urllib.parse.quote(prof.avatar_url, safe="")
-                view_u = f"{blob}?filename={prof.username}_tg_dp&fallback={fb}"
-                dl_u = f"{blob}?dl=1&filename={prof.username}_tg_dp&fallback={fb}"
-            _log_req(request, "tg", "TG HD Pic", f"@{prof.username}", "✅ Success")
-            return _absolutize_urls(
-                {
-                    "ok": True,
-                    "platform": "telegram",
-                    "endpoint": "pic",
-                    "username": prof.username,
-                    "title": prof.title,
-                    "is_verified": prof.is_verified,
-                    "is_channel_or_group": prof.is_channel_or_group,
-                    "raw_url": prof.avatar_url,
-                    "view_url": view_u,
-                    "download_url": dl_u,
-                },
-                origin,
-            )
-
-        if act in ("info", "profile"):
-            res = await api_tg_profile(request, username=q)
-            res["endpoint"] = "info"
-            return _absolutize_urls(res, origin)
-
-        if act in ("story", "stories"):
-            res = await api_tg_stories(request, username=q, pinned=False)
-            res["endpoint"] = "story"
-            return _absolutize_urls(res, origin)
-
-        if act in ("highlights", "highlight", "pinned"):
-            res = await api_tg_stories(request, username=q, pinned=True)
-            res["endpoint"] = "highlights"
-            return _absolutize_urls(res, origin)
-
-        if act in ("post", "posts", "channel"):
-            # Support `/{key}/tg/post/telegram/459` OR `/{key}/tg/post/https://t.me/telegram/459` OR `/{key}/tg/post/telegram`
-            m_short = re.match(r"^@?([A-Za-z0-9_]{3,})/(\d+)$", q)
-            target_url = f"https://t.me/{m_short.group(1)}/{m_short.group(2)}" if m_short else q
-            res = await api_tg_post(request, url=target_url)
-            if "posts" in res:
-                ch_name = res.get("channel", "")
-                for p in res["posts"]:
-                    p["download_api_url"] = f"{origin}/{clean_key}/tg/post/{ch_name}/{p['post_id']}"
-            res["endpoint"] = "post"
-            return _absolutize_urls(res, origin)
-
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown Telegram action '{act}'. Valid: pic, info, story, highlights, post.",
-        )
-
-    raise HTTPException(status_code=404, detail=f"Unknown platform '{platform}'. Use snap, insta, or tg.")
-
-
-@app.get("/{key}/snap/{action}/{query:path}", tags=["1. Snapchat Clean API"])
-async def clean_snap_api(request: Request, key: str, action: str, query: str) -> Any:
-    """`/{key}/snap/{pic|info|story|highlights|spotlight|snapcode}/{query}`"""
-    return await _dispatch_clean_api(request, key, "snap", action, query)
-
-
-@app.get("/{key}/snapchat/{action}/{query:path}", include_in_schema=False)
-async def clean_snapchat_alias(request: Request, key: str, action: str, query: str) -> Any:
-    return await _dispatch_clean_api(request, key, "snap", action, query)
-
-
-@app.get("/{key}/insta/{action}/{query:path}", tags=["2. Instagram Clean API"])
-async def clean_insta_api(request: Request, key: str, action: str, query: str) -> Any:
-    """`/{key}/insta/{pic|info|story|highlights|post|reel}/{query}`"""
-    return await _dispatch_clean_api(request, key, "insta", action, query)
-
-
-@app.get("/{key}/ig/{action}/{query:path}", include_in_schema=False)
-@app.get("/{key}/instagram/{action}/{query:path}", include_in_schema=False)
-async def clean_insta_aliases(request: Request, key: str, action: str, query: str) -> Any:
-    return await _dispatch_clean_api(request, key, "insta", action, query)
-
-
-@app.get("/{key}/tg/{action}/{query:path}", tags=["3. Telegram Clean API"])
-async def clean_tg_api(request: Request, key: str, action: str, query: str) -> Any:
-    """`/{key}/tg/{pic|info|story|highlights|post}/{query}`"""
-    return await _dispatch_clean_api(request, key, "tg", action, query)
-
-
-@app.get("/{key}/telegram/{action}/{query:path}", include_in_schema=False)
-async def clean_tg_alias(request: Request, key: str, action: str, query: str) -> Any:
-    return await _dispatch_clean_api(request, key, "tg", action, query)
-
-
-@app.get("/{key}/{shorthand}/{query:path}", tags=["4. Ultra-Short Endpoints (snappic, instapic, tgpic...)"])
-async def clean_shorthand_api(request: Request, key: str, shorthand: str, query: str) -> Any:
-    """
-    Combined 1-word endpoints:
-    `/{key}/snappic/{query}`, `/{key}/snapinfo/{query}`, `/{key}/snapstory/{query}`, `/{key}/snaphighlights/{query}`,
-    `/{key}/instapic/{query}`, `/{key}/instainfo/{query}`, `/{key}/instastory/{query}`, `/{key}/instahighlights/{query}`, `/{key}/instapost/{query}`, `/{key}/instareel/{query}`,
-    `/{key}/tgpic/{query}`, `/{key}/tginfo/{query}`, `/{key}/tgstory/{query}`, `/{key}/tghighlights/{query}`, `/{key}/tgpost/{query}`
-    """
-    mapped = SHORTHAND_MAP.get(shorthand.lower().strip())
-    if not mapped:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Unknown endpoint '/{key}/{shorthand}/...'. "
-                "Use /{key}/snap|insta|tg/{pic|info|story|highlights|post}/{query} "
-                "or shorthands like /{key}/snappic/{query}, /{key}/instapic/{query}, /{key}/tgpic/{query}."
-            ),
-        )
-    plat, act = mapped
-    return await _dispatch_clean_api(request, key, plat, act, query)
+    async function subActionTg(uname, act) {
+      pushHistorySnapshot();
+      state.action = act;
+      renderChrome(false);
+      document.getElementById('queryInput').value = uname;
+      try { await runTelegram(uname, act); } catch (e) { showError(e); }
+    }
+
+    async function loadTgSinglePost(url) {
+      pushHistorySnapshot();
+      document.getElementById('queryInput').value = url;
+      try { await runTelegram(url, 'post'); } catch (e) { showError(e); }
+    }
+
+    // =====================================================================
+    // INTERACTIVE DEVELOPER API DOCS + LIVE PLAYGROUND (Website/{key}/.../{query})
+    // =====================================================================
+
+    let docsFilter = 'all';
+
+    const API_ENDPOINTS = [
+      // ---------------- SNAPCHAT ----------------
+      {
+        group: 'snap',
+        title: '👻 Snapchat Dual HD Profile Pics (Front + Background)',
+        routeTpl: '/{key}/snap/pic/{query}',
+        shorthandTpl: '/{key}/snappic/{query}',
+        sampleQuery: 'khloekardashian',
+        desc: 'Returns BOTH Front Profile Pic + Background Cover Pic in HD (plus ?direct=1 for direct image binary).'
+      },
+      {
+        group: 'snap',
+        title: '👻 Snapchat Full Profile Info + Dual HD Pics',
+        routeTpl: '/{key}/snap/info/{query}',
+        shorthandTpl: '/{key}/snapinfo/{query}',
+        sampleQuery: 'khloekardashian',
+        desc: 'Full Snapchat creator/user info, subscribers, bio, verified badge, counts & both Front + Background HD pics.'
+      },
+      {
+        group: 'snap',
+        title: '👻 Snapchat Active 24h Stories',
+        routeTpl: '/{key}/snap/story/{query}',
+        shorthandTpl: '/{key}/snapstory/{query}',
+        sampleQuery: 'khloekardashian',
+        desc: 'All active 24-hour public Snapchat story photos & videos with HD view_url & download_url.'
+      },
+      {
+        group: 'snap',
+        title: '👻 Snapchat Curated Highlights (+ Snaps)',
+        routeTpl: '/{key}/snap/highlights/{query}',
+        shorthandTpl: '/{key}/snaphighlights/{query}',
+        sampleQuery: 'khloekardashian',
+        desc: 'Returns all Snapchat Highlights with every HD snap item inside (or pass username/0 for a single highlight).'
+      },
+      {
+        group: 'snap',
+        title: '👻 Snapchat Spotlight HD MP4 & Snapcode QR',
+        routeTpl: '/{key}/snap/spotlight/{query}',
+        shorthandTpl: '/{key}/snapspotlight/{query}',
+        sampleQuery: 'mrbeast',
+        desc: 'Downloads Spotlight HD MP4 by username or Spotlight URL. Also /{key}/snap/snapcode/{query} or /{key}/snapcode/{query} for 1000px PNG QR.'
+      },
+
+      // ---------------- INSTAGRAM ----------------
+      {
+        group: 'insta',
+        title: '📸 Instagram 1080p HD Profile Pic (Public & Private!)',
+        routeTpl: '/{key}/insta/pic/{query}',
+        shorthandTpl: '/{key}/instapic/{query}',
+        sampleQuery: 'virat.kohli',
+        desc: 'Zero-login 1080p HD DP — works unlimited times on Public, Private & 0-post accounts! Add ?direct=1 for raw JPG.'
+      },
+      {
+        group: 'insta',
+        title: '📸 Instagram Full Profile Info + Stats + HD DP',
+        routeTpl: '/{key}/insta/info/{query}',
+        shorthandTpl: '/{key}/instainfo/{query}',
+        sampleQuery: 'virat.kohli',
+        desc: 'Returns followers, following, posts count, bio, external URL, badges, and 1080p HD DP.'
+      },
+      {
+        group: 'insta',
+        title: '📸 Instagram Active 24h Stories',
+        routeTpl: '/{key}/insta/story/{query}',
+        shorthandTpl: '/{key}/instastory/{query}',
+        sampleQuery: 'instagram',
+        desc: 'Downloads all active 24h Instagram story photos & videos.'
+      },
+      {
+        group: 'insta',
+        title: '📸 Instagram Story Highlights (Trays & Slides)',
+        routeTpl: '/{key}/insta/highlights/{query}',
+        shorthandTpl: '/{key}/instahighlights/{query}',
+        sampleQuery: 'virat.kohli',
+        desc: 'Lists all Highlight trays with slides_api_url, or pass username/highlight_id to fetch all HD slides directly.'
+      },
+      {
+        group: 'insta',
+        title: '📸 Instagram Post / Carousel & HD Reels',
+        routeTpl: '/{key}/insta/post/{query}',
+        shorthandTpl: '/{key}/instapost/{query}',
+        sampleQuery: 'DaDJji0DY_x',
+        desc: 'Pass a Post/Reel URL, shortcode, or username! Also /{key}/insta/reel/{query} and /{key}/instareel/{query} for HD Reels.'
+      },
+
+      // ---------------- TELEGRAM ----------------
+      {
+        group: 'tg',
+        title: '✈️ Telegram User / Channel / Group HD Pic',
+        routeTpl: '/{key}/tg/pic/{query}',
+        shorthandTpl: '/{key}/tgpic/{query}',
+        sampleQuery: 'durov',
+        desc: 'Returns HD Telegram profile picture for any public @username, channel, or group (+ ?direct=1 binary mode).'
+      },
+      {
+        group: 'tg',
+        title: '✈️ Telegram Full Profile / Channel Info + Subscribers',
+        routeTpl: '/{key}/tg/info/{query}',
+        shorthandTpl: '/{key}/tginfo/{query}',
+        sampleQuery: 'durov',
+        desc: 'Returns title, @username, verified badge, subscribers/members count, bio, and HD avatar.'
+      },
+      {
+        group: 'tg',
+        title: '✈️ Telegram Public Channel Post / Video / Album',
+        routeTpl: '/{key}/tg/post/{query}',
+        shorthandTpl: '/{key}/tgpost/{query}',
+        sampleQuery: 'telegram/459',
+        desc: 'Pass channel/post_id (e.g. telegram/459), full t.me URL, or channel username to list recent media posts.'
+      },
+      {
+        group: 'tg',
+        title: '✈️ Telegram Active Stories & Pinned Highlights',
+        routeTpl: '/{key}/tg/story/{query}',
+        shorthandTpl: '/{key}/tgstory/{query}',
+        sampleQuery: 'durov',
+        desc: 'Fetches active 24h Telegram Stories. Also /{key}/tg/highlights/{query} and /{key}/tghighlights/{query} for Pinned Highlights.'
+      }
+    ];
+
+    function setDocsFilter(f) {
+      docsFilter = f;
+      renderApiDocs();
+    }
+
+    function renderApiDocs() {
+      const origin = window.location.origin;
+      const keyVal = (document.getElementById('docsApiKeyInput')?.value || 'demo').trim() || 'demo';
+      document.getElementById('baseUrlDisplay').textContent = `${origin}/${keyVal}/...`;
+
+      const filters = [
+        { id: 'all', label: '🌐 All Endpoints' },
+        { id: 'snap', label: '👻 Snapchat' },
+        { id: 'insta', label: '📸 Instagram' },
+        { id: 'tg', label: '✈️ Telegram' }
+      ];
+      document.getElementById('docsFilterPills').innerHTML = filters.map(f => `
+        <button type="button" class="action-pill ${docsFilter === f.id ? 'active' : ''}" onclick="setDocsFilter('${f.id}')">${f.label}</button>
+      `).join('');
+
+      const visible = API_ENDPOINTS.filter(e => docsFilter === 'all' || e.group === docsFilter);
+      const box = document.getElementById('apiEndpointsContainer');
+      box.innerHTML = visible.map((ep, idx) => {
+        const pathPreview = ep.routeTpl.replace('{key}', keyVal);
+        const shortPreview = ep.shorthandTpl.replace('{key}', keyVal);
+        const fullUrl = `${origin}${pathPreview.replace('{query}', ep.sampleQuery)}`;
+        const shortFullUrl = `${origin}${shortPreview.replace('{query}', ep.sampleQuery)}`;
+        const curlCode = `# Standard Path:\ncurl -s "${fullUrl}" | jq .\n\n# 1-Word Shorthand:\ncurl -s "${shortFullUrl}" | jq .`;
+        const jsCode = `const res = await fetch("${fullUrl}");\nconst data = await res.json();\nconsole.log(data);`;
+        const pyCode = `import requests\n\nr = requests.get("${fullUrl}")\nprint(r.json())`;
+        return `
+          <div class="docs-endpoint">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;">
+              <div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span class="method-badge">GET</span>
+                  <span class="ep-path">${esc(pathPreview)}</span>
+                </div>
+                <div style="margin-top:5px;font-size:12px;color:#94a3b8;">
+                  ⚡ Shorthand: <code style="color:#215da9;">${esc(shortPreview)}</code>
+                </div>
+              </div>
+              <strong style="font-size:13.5px;color:#284e75;">${esc(ep.title)}</strong>
+            </div>
+            <p style="font-size:13px;color:var(--text-muted);margin:8px 0 12px;">${esc(ep.desc)}</p>
+
+            <div class="search-row" style="margin-bottom:10px;">
+              <input id="epQuery_${idx}" class="search-input" style="padding:9px 12px;font-size:13px;font-family:monospace;" value="${esc(ep.sampleQuery)}" placeholder="Enter {query}..." />
+              <button class="btn-primary" style="padding:9px 16px;font-size:13px;" onclick="tryEndpointLive(${idx}, '${ep.routeTpl}')">▶️ Try Live</button>
+              <button class="btn-ghost" onclick="tryEndpointLive(${idx}, '${ep.shorthandTpl}')">⚡ Try Shorthand</button>
+              <button class="btn-ghost" onclick="copyText(document.getElementById('epCode_${idx}').textContent)">📋 Copy</button>
+            </div>
+
+            <div style="display:flex;gap:6px;margin-bottom:4px;">
+              <button class="chip" onclick="setSnippet(${idx}, ${JSON.stringify(curlCode).replace(/"/g, '&quot;')})">cURL</button>
+              <button class="chip" onclick="setSnippet(${idx}, ${JSON.stringify(jsCode).replace(/"/g, '&quot;')})">JavaScript</button>
+              <button class="chip" onclick="setSnippet(${idx}, ${JSON.stringify(pyCode).replace(/"/g, '&quot;')})">Python</button>
+            </div>
+            <pre class="code-block" id="epCode_${idx}">${esc(curlCode)}</pre>
+            <pre class="code-block hidden" id="epOut_${idx}" style="border-color:rgba(16,185,129,0.4);color:#a7f3d0;"></pre>
+          </div>
+        `;
+      }).join('') + `<div class="result-box">${resultNavFooter()}</div>`;
+    }
+
+    function setSnippet(idx, txt) {
+      document.getElementById(`epCode_${idx}`).textContent = txt;
+    }
+
+    function copyText(t) {
+      navigator.clipboard?.writeText(t);
+    }
+
+    async function tryEndpointLive(idx, routeTpl) {
+      const keyVal = (document.getElementById('docsApiKeyInput')?.value || 'demo').trim() || 'demo';
+      const q = document.getElementById(`epQuery_${idx}`).value.trim();
+      const targetPath = routeTpl.replace('{key}', encodeURIComponent(keyVal)).replace('{query}', q);
+      const out = document.getElementById(`epOut_${idx}`);
+      out.classList.remove('hidden');
+      out.textContent = `⏳ GET ${window.location.origin}${targetPath} ...`;
+      const t0 = performance.now();
+      try {
+        const res = await fetch(targetPath);
+        const json = await res.json();
+        const ms = Math.round(performance.now() - t0);
+        out.textContent = `// GET ${window.location.origin}${targetPath} — HTTP ${res.status} (${ms} ms)\n` + JSON.stringify(json, null, 2);
+      } catch (e) {
+        out.textContent = 'Error: ' + e.message;
+      }
+    }
+
+    // =====================================================================
+    // ADMIN PANEL (ZERO-DB /tmp FILE + API KEYS + VISITOR SEARCH HISTORIES)
+    // =====================================================================
+
+    function initAdminTab() {
+      if (state.adminKey) {
+        loadAdminSummary();
+      } else {
+        document.getElementById('adminLockCard').classList.remove('hidden');
+        document.getElementById('adminDashboard').classList.add('hidden');
+      }
+    }
+
+    async function unlockAdmin(e) {
+      e.preventDefault();
+      state.adminKey = document.getElementById('adminKeyInput').value.trim();
+      await loadAdminSummary();
+    }
+
+    async function createAdminApiKey() {
+      const custom = document.getElementById('newApiKeyInp')?.value.trim() || '';
+      const lbl = document.getElementById('newApiKeyLbl')?.value.trim() || 'Custom Key';
+      await fetch(`/api/v1/admin/keys/create?key=${encodeURIComponent(state.adminKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ custom_key: custom, label: lbl })
+      });
+      loadAdminSummary();
+    }
+
+    async function removeAdminApiKey(k) {
+      await fetch(`/api/v1/admin/keys/delete?key=${encodeURIComponent(state.adminKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_key: k })
+      });
+      loadAdminSummary();
+    }
+
+    async function toggleOpenKeyMode() {
+      await fetch(`/api/v1/admin/keys/toggle-mode?key=${encodeURIComponent(state.adminKey)}`, { method: 'POST' });
+      loadAdminSummary();
+    }
+
+    async function loadAdminSummary(selectedVisitorId = null) {
+      try {
+        const d = await fetch(`/api/v1/admin/summary?key=${encodeURIComponent(state.adminKey)}`).then(async r => {
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.detail || 'Unauthorized');
+          return j;
+        });
+        sessionStorage.setItem('sg_admin_key', state.adminKey);
+        document.getElementById('adminLockCard').classList.add('hidden');
+        const dash = document.getElementById('adminDashboard');
+        dash.classList.remove('hidden');
+
+        const m = d.metrics;
+        const selectedVis = selectedVisitorId ? d.visitors.find(v => v.visitor_id === selectedVisitorId) : null;
+
+        dash.innerHTML = `
+          <div class="result-box" style="margin-bottom:18px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+              <div>
+                <h2>👑 Admin Control Panel (Zero-DB \`/tmp\` Mode)</h2>
+                <p style="font-size:12.5px;color:var(--text-muted);">Temp Store: <code>${esc(d.tmp_path)}</code> (${d.tmp_size_kb} KB) • Uptime: ${esc(d.uptime)}</p>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button class="btn-ghost" onclick="toggleAdminAlerts()">
+                  🔔 Live TG Alerts: ${d.live_tg_alerts ? '🟢 ON' : '🔴 OFF'}
+                </button>
+                <button class="btn-ghost" onclick="toggleOpenKeyMode()">
+                  🔑 Key Mode: ${d.open_key_mode ? '🔓 Open (Any Key)' : '🔐 Whitelist Only'}
+                </button>
+                <a class="btn-primary" style="padding:8px 14px;font-size:13px;" href="/api/v1/admin/export-txt?key=${encodeURIComponent(state.adminKey)}" download>📄 Export Temp File (.txt)</a>
+                <button class="btn-ghost" onclick="loadAdminSummary()">🔄 Refresh</button>
+                <button class="btn-ghost" style="color:#fca5a5;" onclick="clearAdminHistory()">🗑️ Clear /tmp</button>
+              </div>
+            </div>
+
+            <div class="stats-row">
+              <div class="stat-tile"><div class="stat-val">${d.unique_visitors}</div><div class="stat-lbl">Unique Visitors</div></div>
+              <div class="stat-tile"><div class="stat-val">${m.total_searches}</div><div class="stat-lbl">Total Searches</div></div>
+              <div class="stat-tile"><div class="stat-val">${m.ig_searches} / ${m.snap_searches} / ${m.tg_searches}</div><div class="stat-lbl">IG / Snap / TG</div></div>
+              <div class="stat-tile"><div class="stat-val">${m.api_calls}</div><div class="stat-lbl">API Endpoint Calls</div></div>
+            </div>
+
+            <!-- API KEY MANAGER -->
+            <div class="bio-box" style="margin-top:14px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
+                <strong>🔑 Path API Keys (<code>Website/(key)/snap|insta|tg/...</code>)</strong>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                  <input id="newApiKeyInp" placeholder="Custom key (or blank = random)" style="background:var(--bg-input);border:1px solid var(--border-strong);color:var(--text);padding:6px 10px;border-radius:8px;font-size:12.5px;" />
+                  <input id="newApiKeyLbl" placeholder="Label (e.g. Client 1)" style="background:var(--bg-input);border:1px solid var(--border-strong);color:var(--text);padding:6px 10px;border-radius:8px;font-size:12.5px;width:130px;" />
+                  <button class="btn-primary" style="padding:6px 12px;font-size:12.5px;border-radius:8px;" onclick="createAdminApiKey()">➕ Add Key</button>
+                </div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                ${(d.api_keys || []).map(ak => `
+                  <span class="tag" style="padding:6px 10px;display:inline-flex;align-items:center;gap:8px;">
+                    <code>${esc(ak.key)}</code> <span style="color:var(--text-muted);">(${ak.calls} calls)</span>
+                    ${ak.key !== state.adminKey ? `<button onclick="removeAdminApiKey('${esc(ak.key)}')" style="background:none;border:none;color:#fca5a5;cursor:pointer;font-weight:800;">✕</button>` : ''}
+                  </span>
+                `).join('')}
+              </div>
+            </div>
+
+            ${selectedVis ? `
+              <div class="bio-box" style="margin-top:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+                  <strong>👤 Visitor Details: ${esc(selectedVis.visitor_id)} (${esc(selectedVis.ip_masked)})</strong>
+                  <div style="display:flex;gap:8px;">
+                    <a class="btn-ghost" href="/api/v1/admin/export-txt?key=${encodeURIComponent(state.adminKey)}&visitor_id=${encodeURIComponent(selectedVis.visitor_id)}" download>📄 Visitor .txt</a>
+                    <button class="btn-ghost" onclick="loadAdminSummary()">⬅️ Back to All Visitors</button>
+                  </div>
+                </div>
+                <div style="font-size:12.5px;color:var(--text-muted);margin-bottom:10px;">
+                  First Seen: ${esc(selectedVis.first_seen)} • Last Active: ${esc(selectedVis.last_seen)} • Searches: ${selectedVis.total_searches}
+                </div>
+                ${(selectedVis.searches || []).map((s, idx) => `
+                  <div style="padding:6px 0;border-top:1px solid var(--border);font-size:12.5px;">
+                    ${idx + 1}. <code>${esc(s.time)}</code> — [${esc(s.source)}] ${esc(s.app)} (${esc(s.action)}) ➜ <b>${esc(s.query)}</b> [${esc(s.status)}]
+                  </div>
+                `).join('')}
+              </div>
+            ` : `
+              <h3 style="margin-top:18px;font-size:15px;">👥 Visitors (Click any visitor to inspect full search history)</h3>
+              <div class="table-scroll">
+                <table class="adm-table">
+                  <thead><tr><th>Visitor ID</th><th>Masked IP</th><th>Searches (IG/Snap/TG)</th><th>Last Active</th><th>Action</th></tr></thead>
+                  <tbody>
+                    ${d.visitors.length ? d.visitors.map(v => `
+                      <tr>
+                        <td><code>${esc(v.visitor_id)}</code></td>
+                        <td>${esc(v.ip_masked)}</td>
+                        <td><b>${v.total_searches}</b> (${v.ig_count}/${v.snap_count}/${v.tg_count})</td>
+                        <td>${esc(v.last_seen)}</td>
+                        <td><button class="chip" onclick="loadAdminSummary('${esc(v.visitor_id)}')">📜 View History</button></td>
+                      </tr>
+                    `).join('') : '<tr><td colspan="5" style="color:var(--text-muted);">No searches recorded yet. Try searching any profile!</td></tr>'}
+                  </tbody>
+                </table>
+              </div>
+
+              <h3 style="margin-top:22px;font-size:15px;">📜 Live Global Search Feed</h3>
+              <div class="table-scroll">
+                <table class="adm-table">
+                  <thead><tr><th>Time (IST)</th><th>Visitor</th><th>Source / Key</th><th>Platform &amp; Action</th><th>Query</th><th>Status</th></tr></thead>
+                  <tbody>
+                    ${d.recent_searches.slice(0, 25).map(s => `
+                      <tr>
+                        <td>${esc(s.time)}</td>
+                        <td><code>${esc(s.visitor_id)}</code></td>
+                        <td><code>${esc(s.source)}</code></td>
+                        <td>${esc(s.app)} • ${esc(s.action)}</td>
+                        <td><code>${esc(s.query)}</code></td>
+                        <td>${esc(s.status)}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              </div>
+            `}
+            ${resultNavFooter()}
+          </div>
+        `;
+      } catch (err) {
+        state.adminKey = '';
+        sessionStorage.removeItem('sg_admin_key');
+        document.getElementById('adminLockCard').classList.remove('hidden');
+        document.getElementById('adminDashboard').classList.add('hidden');
+        alert(err.message || 'Invalid Admin Key');
+      }
+    }
+
+    async function toggleAdminAlerts() {
+      await fetch(`/api/v1/admin/toggle-alerts?key=${encodeURIComponent(state.adminKey)}`, { method: 'POST' });
+      loadAdminSummary();
+    }
+
+    async function clearAdminHistory() {
+      if (!confirm('Clear /tmp search history and counters?')) return;
+      await fetch(`/api/v1/admin/clear?key=${encodeURIComponent(state.adminKey)}`, { method: 'POST' });
+      loadAdminSummary();
+    }
+
+    // =====================================================================
+    // AUTH MODALS (IG SESSION + TG MTPROTO)
+    // =====================================================================
+
+    async function refreshHealthBadges() {
+      try {
+        const d = await fetch('/api/v1/health').then(r => r.json());
+        const ig = d.platforms?.instagram;
+        const tg = d.platforms?.telegram;
+        document.getElementById('igAuthBadge').textContent = ig?.session_connected
+          ? `🟢 IG: @${ig.logged_in_user || 'Connected'}`
+          : '🔐 IG: Zero-Login Ready';
+        document.getElementById('tgAuthBadge').textContent = tg?.stories_mtproto_connected
+          ? `🟢 TG Stories: ${tg.mtproto_account || 'Unlocked'}`
+          : '✈️ TG Stories: Unlock';
+      } catch (e) {}
+    }
+
+    function openIgModal() {
+      document.getElementById('igModalMsg').textContent = '';
+      document.getElementById('igLoginStep1').classList.remove('hidden');
+      document.getElementById('igLoginStep2').classList.add('hidden');
+      document.getElementById('igModal').classList.add('open');
+    }
+
+    async function submitIgLogin() {
+      const msg = document.getElementById('igModalMsg');
+      msg.textContent = '⏳ Connecting to Instagram...';
+      try {
+        const r = await apiFetch('/api/v1/instagram/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('igUserInp').value,
+            password: document.getElementById('igPassInp').value
+          })
+        });
+        document.getElementById('igPassInp').value = '';
+        if (r.status === 'need_2fa') {
+          document.getElementById('igLoginStep1').classList.add('hidden');
+          document.getElementById('igLoginStep2').classList.remove('hidden');
+          msg.textContent = r.message || 'Enter 2FA code';
+          return;
+        }
+        msg.textContent = `✅ Connected as @${r.username}`;
+        refreshHealthBadges();
+        setTimeout(closeModals, 900);
+      } catch (e) { msg.textContent = '❌ ' + e.message; }
+    }
+
+    async function submitIg2fa() {
+      const msg = document.getElementById('igModalMsg');
+      msg.textContent = '⏳ Verifying 2FA...';
+      try {
+        const r = await apiFetch('/api/v1/instagram/2fa', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: document.getElementById('ig2faInp').value })
+        });
+        msg.textContent = `✅ Connected as @${r.username}`;
+        refreshHealthBadges();
+        setTimeout(closeModals, 900);
+      } catch (e) { msg.textContent = '❌ ' + e.message; }
+    }
+
+    async function igLogout() {
+      await apiFetch('/api/v1/instagram/logout', { method: 'POST' });
+      refreshHealthBadges();
+      closeModals();
+    }
+
+    function openTgModal() {
+      document.getElementById('tgModalMsg').textContent = '';
+      document.getElementById('tgStep1').classList.remove('hidden');
+      document.getElementById('tgStep2').classList.add('hidden');
+      document.getElementById('tgStep3').classList.add('hidden');
+      document.getElementById('tgModal').classList.add('open');
+    }
+
+    async function startTgMtproto() {
+      const msg = document.getElementById('tgModalMsg');
+      msg.textContent = '⏳ Sending Telegram OTP...';
+      try {
+        await apiFetch('/api/v1/telegram/mtproto/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_id: Number(document.getElementById('tgApiId').value),
+            api_hash: document.getElementById('tgApiHash').value,
+            phone: document.getElementById('tgPhone').value
+          })
+        });
+        document.getElementById('tgStep1').classList.add('hidden');
+        document.getElementById('tgStep2').classList.remove('hidden');
+        msg.textContent = '📲 OTP sent to your Telegram app!';
+      } catch (e) { msg.textContent = '❌ ' + e.message; }
+    }
+
+    async function verifyTgOtp() {
+      const msg = document.getElementById('tgModalMsg');
+      msg.textContent = '⏳ Verifying OTP...';
+      try {
+        const r = await apiFetch('/api/v1/telegram/mtproto/verify-otp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: document.getElementById('tgOtp').value })
+        });
+        if (r.status === 'need_2fa') {
+          document.getElementById('tgStep2').classList.add('hidden');
+          document.getElementById('tgStep3').classList.remove('hidden');
+          msg.textContent = '🔐 Enter your Telegram 2FA Cloud Password.';
+          return;
+        }
+        msg.textContent = `✅ Connected (${r.account})!`;
+        refreshHealthBadges();
+        setTimeout(closeModals, 900);
+      } catch (e) { msg.textContent = '❌ ' + e.message; }
+    }
+
+    async function verifyTg2fa() {
+      const msg = document.getElementById('tgModalMsg');
+      try {
+        const r = await apiFetch('/api/v1/telegram/mtproto/verify-2fa', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: document.getElementById('tg2faPass').value })
+        });
+        msg.textContent = `✅ Connected (${r.account})!`;
+        refreshHealthBadges();
+        setTimeout(closeModals, 900);
+      } catch (e) { msg.textContent = '❌ ' + e.message; }
+    }
+
+    // Boot UI
+    renderChrome(true);
+    updateNavBar();
+    refreshHealthBadges();
+  </script>
+</body>
+</html>
