@@ -280,9 +280,9 @@ class TelegramMediaService:
                 seen_urls.add(u)
                 items.append(MediaItem(is_video=False, media_url=u, shortcode=post_id))
 
-        if not items:
+        if not items and not caption:
             raise TelegramFetchError(
-                f"`t.me/{clean}/{post_id}` mein koi downloadable photo/video nahi hai (ya file >50MB web preview ke bahar hai)."
+                f"`t.me/{clean}/{post_id}` ka public text ya downloadable media nahi mila; post unavailable ya unsupported ho sakti hai."
             )
 
         return TgPostMedia(
@@ -293,40 +293,61 @@ class TelegramMediaService:
             items=items,
         )
 
-    def get_recent_channel_posts(self, channel: str, limit: int = 8) -> List[Dict[str, str]]:
-        """List recent media posts from `https://t.me/s/<channel>`."""
+    def get_channel_posts_page(self, channel: str, limit: int = 10, before: Optional[int] = None) -> Dict[str, Any]:
+        """Newest-first public web preview posts, including text-only posts.
+
+        `before` is Telegram's exclusive post-id cursor. Never eagerly traverse the
+        whole channel: each request loads at most a page from the public preview.
+        """
         clean = channel.strip().lstrip("@").lower()
+        if not TG_USER_RE.fullmatch(clean):
+            raise TelegramFetchError("Invalid public Telegram channel username.")
         resp = requests.get(
             f"https://t.me/s/{clean}",
-            headers={"User-Agent": TG_UA},
-            timeout=15,
+            params={"before": before} if before is not None else None,
+            headers={"User-Agent": TG_UA}, timeout=15,
         )
         if resp.status_code != 200:
-            return []
-
+            raise TelegramFetchError(f"Telegram channel preview HTTP {resp.status_code}; please retry.")
         blocks = resp.text.split('data-post="')
         found: List[Dict[str, str]] = []
+        seen = set()
         for blk in reversed(blocks[1:]):
-            post_ref = blk.split('"', 1)[0]  # e.g. "durov/340"
-            if "/" not in post_ref:
+            post_ref = blk.split('"', 1)[0]
+            ch, sep, pid = post_ref.partition("/")
+            if not sep or ch.lower() != clean or not pid.isdigit() or pid in seen:
                 continue
-            pid = post_ref.split("/", 1)[1]
+            if before is not None and int(pid) >= before:
+                continue
+            seen.add(pid)
             has_vid = "<video" in blk or "tgme_widget_message_video" in blk
             has_pic = "tgme_widget_message_photo_wrap" in blk
-            if not (has_vid or has_pic):
-                continue
             cap_m = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', blk, re.S)
-            snip = _strip_html(cap_m.group(1))[:40] if cap_m else ""
-            found.append(
-                {
-                    "post_id": pid,
-                    "icon": "🎬" if has_vid else "🖼",
-                    "snippet": snip or f"Post #{pid}",
-                }
-            )
-            if len(found) >= limit:
-                break
-        return found
+            text = _strip_html(cap_m.group(1)) if cap_m else ""
+            views_m = re.search(r'class="tgme_widget_message_views"[^>]*>(.*?)</span>', blk, re.S)
+            date_m = re.search(r'<time[^>]*datetime="([^"]+)"', blk, re.S)
+            video_m = re.search(r'<video[^>]+src="([^"]+)"', blk)
+            photo_m = re.search(r"tgme_widget_message_photo_wrap[^>]+background-image:url\('([^']+)'\)", blk)
+            preview = htmllib.unescape((video_m or photo_m).group(1)).strip() if (video_m or photo_m) else ""
+            if not preview.startswith("https://"):
+                preview = ""
+            found.append({
+                "post_id": pid, "icon": "🎬" if has_vid else ("🖼" if has_pic else "📝"),
+                "type": "video" if has_vid else ("photo" if has_pic else "text"),
+                "text": text, "snippet": text[:160] or f"Post #{pid}",
+                "views": _strip_html(views_m.group(1)) if views_m else "",
+                "date": htmllib.unescape(date_m.group(1)) if date_m else "",
+                "preview_url": preview,
+                "preview_is_video": bool(video_m),
+            })
+        posts = found[:limit]
+        # The preview can contain more than one screen. If Telegram returned at
+        # least a full screen, allow another cursor request; an empty page ends it.
+        has_more = bool(posts) and (len(found) > limit or len(found) >= 10)
+        return {"posts": posts, "next_before": int(posts[-1]["post_id"]) if has_more else None, "has_more": has_more}
+
+    def get_recent_channel_posts(self, channel: str, limit: int = 8) -> List[Dict[str, str]]:
+        return self.get_channel_posts_page(channel, limit)["posts"]
 
     # ------------------------------------------------------------------
     # Optional Telethon MTProto Setup & Story / Highlight Downloader
